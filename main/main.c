@@ -1,13 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "driver/gpio.h"
-#include "driver/uart.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_smartconfig.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -17,10 +10,14 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "tcpip_adapter.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_smartconfig.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
 
-// ---------------------------------------------------------
-// HARDWARE & SYSTEM CONSTANTS
-// ---------------------------------------------------------
 #define PIN_RELAY GPIO_NUM_0
 #define PIN_LED GPIO_NUM_2
 
@@ -52,9 +49,6 @@ static const char* TAG_SYS = "system";
 static const char* TAG_WIFI = "wifi";
 static const char* TAG_NET = "tcp_srv";
 
-// ---------------------------------------------------------
-// PROTOCOL DEFINITIONS
-// ---------------------------------------------------------
 typedef enum {
   CMD_RELAY_OFF = 0x01,
   CMD_RELAY_ON = 0x02,
@@ -69,9 +63,6 @@ typedef enum {
   STATE_LED_ON = 0xB2
 } protocol_state_t;
 
-// ---------------------------------------------------------
-// GLOBALS & CONCURRENCY
-// ---------------------------------------------------------
 static QueueHandle_t s_uart_queue;
 static EventGroupHandle_t s_wifi_event_group;
 static TaskHandle_t s_sc_task_handle = NULL;
@@ -81,54 +72,38 @@ static int s_retry_num = 0;
 static bool s_relay_active = false;
 static bool s_led_active = false;
 
-// ---------------------------------------------------------
-// FUNCTION PROTOTYPES
-// ---------------------------------------------------------
-
-// Hardware Abstraction Layer (HAL)
 static void hardware_init(void);
 static void set_relay(bool active);
 static void set_led(bool active);
-
-// Logic Controller
 static void process_commands(const uint8_t* buf, size_t len);
-
-// Network, Event Handlers & Persistence
 static void network_init(void);
 static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id,
                                void* data);
 static esp_err_t load_creds(wifi_config_t* out_cfg);
 static esp_err_t persist_creds(const uint8_t* ssid, const uint8_t* password);
-
-// Tasks & Client Handling
 static void uart_event_task(void* arg);
 static void tcp_server_task(void* arg);
 static void smartconfig_task(void* arg);
 static void handle_client_connection(struct netconn* client_conn);
 
-// ---------------------------------------------------------
-// APPLICATION ENTRY
-// ---------------------------------------------------------
 void app_main(void) {
-  esp_err_t nvs_err = nvs_flash_init();
-  if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES) {
-    ESP_LOGW(TAG_SYS,
-             "NVS partition full or corrupt — erasing and reinitializing.");
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    nvs_err = nvs_flash_init();
-  }
-  ESP_ERROR_CHECK(nvs_err);
+    ESP_LOGI(TAG_SYS, "Firmware starting...");
 
-  hardware_init();
-  network_init();
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
-  xTaskCreate(tcp_server_task, "tcp_server", TCP_TASK_STACK, NULL,
-              TCP_TASK_PRIO, NULL);
+    hardware_init();
+    network_init();
+
+    xTaskCreate(tcp_server_task, "tcp_srv", TCP_TASK_STACK, NULL, TCP_TASK_PRIO, NULL);
+
+    ESP_LOGI(TAG_SYS, "Init complete.");
 }
 
-// ---------------------------------------------------------
-// HARDWARE ABSTRACTION LAYER (HAL)
-// ---------------------------------------------------------
 static void hardware_init(void) {
   const gpio_config_t io = {
       .pin_bit_mask = BIT(PIN_RELAY) | BIT(PIN_LED),
@@ -139,11 +114,10 @@ static void hardware_init(void) {
   };
   ESP_ERROR_CHECK(gpio_config(&io));
 
-  // Force default known-safe states (Off / Pins High due to active-low wiring)
   set_relay(false);
   set_led(false);
 
-  const uart_config_t cfg = {
+  uart_config_t cfg = {
       .baud_rate = UART_BAUD,
       .data_bits = UART_DATA_8_BITS,
       .parity = UART_PARITY_DISABLE,
@@ -154,14 +128,10 @@ static void hardware_init(void) {
   ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_BUF_SIZE, UART_BUF_SIZE,
                                       UART_QUEUE_DEPTH, &s_uart_queue, 0));
 
-  xTaskCreate(uart_event_task, "uart_ev", UART_TASK_STACK, NULL, UART_TASK_PRIO,
-              NULL);
-  ESP_LOGI(TAG_SYS, "Hardware abstraction layer bound and initialized.");
+  xTaskCreate(uart_event_task, "uart_ev", UART_TASK_STACK, NULL, UART_TASK_PRIO, NULL);
+  ESP_LOGI(TAG_SYS, "Hardware OK.");
 }
 
-// ---------------------------------------------------------
-// NETWORK INFRASTRUCTURE & PERSISTENCE
-// ---------------------------------------------------------
 static void network_init(void) {
   s_wifi_event_group = xEventGroupCreate();
 
@@ -171,8 +141,7 @@ static void network_init(void) {
 
   wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
-  ESP_ERROR_CHECK(
-      esp_wifi_set_ps(WIFI_PS_NONE));  // Max power for responsive networking
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                              wifi_event_handler, NULL));
@@ -193,11 +162,9 @@ static void network_init(void) {
 }
 
 static void set_relay(bool active) {
-  taskENTER_CRITICAL();  // Critical section protects context preemption on
-                         // single core
+  taskENTER_CRITICAL();
   s_relay_active = active;
-  gpio_set_level(PIN_RELAY,
-                 active ? 0 : 1);  // Hardware inversion: active-low relay
+  gpio_set_level(PIN_RELAY, active ? 0 : 1);
   taskEXIT_CRITICAL();
 }
 
@@ -208,9 +175,6 @@ static void set_led(bool active) {
   taskEXIT_CRITICAL();
 }
 
-// ---------------------------------------------------------
-// DOMAIN / BUSINESS LOGIC CONTROLLER
-// ---------------------------------------------------------
 static void process_commands(const uint8_t* buf, size_t len) {
   for (size_t i = 0; i < len; i++) {
     switch (buf[i]) {
@@ -316,9 +280,6 @@ static esp_err_t persist_creds(const uint8_t* ssid, const uint8_t* password) {
   return err;
 }
 
-// ---------------------------------------------------------
-// FREERTOS CONCURRENT EXECUTION MECHANICS
-// ---------------------------------------------------------
 static void smartconfig_task(void* arg) {
   ESP_ERROR_CHECK(esp_smartconfig_set_type(CONFIG_ESP_SMARTCONFIG_TYPE));
   smartconfig_start_config_t sc_cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
@@ -333,7 +294,7 @@ static void smartconfig_task(void* arg) {
   }
 
   esp_smartconfig_stop();
-  s_sc_task_handle = NULL;  // Structural release lock prior to deletion
+  s_sc_task_handle = NULL;
   vTaskDelete(NULL);
 }
 
