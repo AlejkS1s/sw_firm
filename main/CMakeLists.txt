@@ -1,3 +1,3 @@
-set(COMPONENT_SRCS "switch_firm.c")
+set(COMPONENT_SRCS "main.c")
 
 register_component()
