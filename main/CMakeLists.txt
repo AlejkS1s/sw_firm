@@ -1,3 +1,9 @@
-set(COMPONENT_SRCS "main.c")
-
+set(COMPONENT_SRCS
+    main.c
+    gpio.c
+    protocol.c
+    wifi.c
+    tcp.c
+    uart.c
+)
 register_component()
