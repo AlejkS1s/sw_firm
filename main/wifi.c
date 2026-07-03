@@ -169,7 +169,7 @@ static void handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
                     s_retry++;
                     ESP_LOGI(TAG, "Reconnect %d/%d (reason %d)",
                              s_retry, MAX_WIFI_RETRY, d->reason);
-                    led_set_pattern(LED_BLINK_SLOW);
+                    wifi_set_connected(false);
                     esp_wifi_connect();
                 } else {
                     ESP_LOGW(TAG, "Connect failed, fallback to SC");
@@ -198,7 +198,7 @@ static void handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
                 esp_smartconfig_stop();
         }
 
-        led_set_pattern(LED_OFF);
+        wifi_set_connected(true);
         s_state = CSTATE_CONNECTED;
         xEventGroupSetBits(s_evt_grp, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "Online");
@@ -262,7 +262,7 @@ void wifi_init(void) {
     wifi_config_t saved = {0};
     if (creds_load(&saved) == ESP_OK) {
         s_state = CSTATE_SAVED;
-        led_set_pattern(LED_BLINK_SLOW);
+        wifi_set_connected(false);
         ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &saved));
         ESP_LOGI(TAG, "Saved credentials loaded");
     }

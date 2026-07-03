@@ -53,17 +53,24 @@ static bool json_bool(const char *json, const char *key, bool def) {
 }
 
 static esp_err_t get_state(httpd_req_t *req) {
-    char buf[256];
+    char buf[512];
     time_t now = time(NULL);
     bool time_ok = now > 100000;
     int active = timer_sched_is_active() ? 1 : 0;
+    uint32_t rem = timer_sched_remaining();
+    uint32_t total = timer_sched_total();
 
     snprintf(buf, sizeof(buf),
-        "{\"relay\":%s,\"led\":%s,\"timer\":%s,\"timer_rem\":0,\"time\":%s}",
+        "{\"relay\":%s,\"led\":%s,\"timer\":%s,\"timer_rem\":%lu,"
+        "\"timer_total\":%lu,\"time\":%s,\"boot\":%d,\"led_mode\":%d}",
         relay_get() ? "true" : "false",
         led_get() ? "true" : "false",
         active ? "true" : "false",
-        time_ok ? "true" : "false");
+        (unsigned long)rem,
+        (unsigned long)total,
+        time_ok ? "true" : "false",
+        relay_get_boot_behavior(),
+        led_get_mode());
     return send_json(req, buf);
 }
 
@@ -160,6 +167,26 @@ static esp_err_t post_schedules_remove(httpd_req_t *req) {
     return send_json(req, "{\"ok\":true}");
 }
 
+static esp_err_t post_boot(httpd_req_t *req) {
+    char *body = read_body(req);
+    if (!body) { httpd_resp_send_500(req); return ESP_FAIL; }
+    int mode = json_int(body, "mode", -1);
+    free(body);
+    if (mode < 0 || mode > 2) { httpd_resp_send_500(req); return ESP_FAIL; }
+    relay_set_boot_behavior((uint8_t)mode);
+    return send_json(req, "{\"ok\":true}");
+}
+
+static esp_err_t post_led(httpd_req_t *req) {
+    char *body = read_body(req);
+    if (!body) { httpd_resp_send_500(req); return ESP_FAIL; }
+    int mode = json_int(body, "mode", -1);
+    free(body);
+    if (mode < 0 || mode > 15) { httpd_resp_send_500(req); return ESP_FAIL; }
+    led_set_mode((uint8_t)mode);
+    return send_json(req, "{\"ok\":true}");
+}
+
 static esp_err_t handler(httpd_req_t *req) {
     if (req->method == HTTP_OPTIONS) {
         httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -197,6 +224,8 @@ static esp_err_t handler(httpd_req_t *req) {
         if (strcmp(req->uri, "/timer/cancel") == 0)   return post_timer_cancel(req);
         if (strcmp(req->uri, "/schedules") == 0)      return post_schedules(req);
         if (strcmp(req->uri, "/schedules/remove") == 0) return post_schedules_remove(req);
+        if (strcmp(req->uri, "/boot") == 0)            return post_boot(req);
+        if (strcmp(req->uri, "/led") == 0)             return post_led(req);
     }
     httpd_resp_send_404(req);
     return ESP_FAIL;
@@ -207,7 +236,7 @@ int http_server_start(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
 
     ESP_LOGI(TAG, "Starting HTTP on port %d", cfg.server_port);
     esp_err_t ret = httpd_start(&server, &cfg);
@@ -221,8 +250,10 @@ int http_server_start(void) {
         {"/on", HTTP_POST}, {"/off", HTTP_POST}, {"/toggle", HTTP_POST},
         {"/timer", HTTP_POST}, {"/timer/cancel", HTTP_POST},
         {"/schedules", HTTP_POST}, {"/schedules/remove", HTTP_POST},
+        {"/boot", HTTP_POST}, {"/led", HTTP_POST},
         {"/timer", HTTP_OPTIONS},
         {"/schedules", HTTP_OPTIONS}, {"/schedules/remove", HTTP_OPTIONS},
+        {"/boot", HTTP_OPTIONS}, {"/led", HTTP_OPTIONS},
     };
     for (int i = 0; i < sizeof(routes)/sizeof(routes[0]); i++) {
         httpd_uri_t u = { .uri = routes[i].u, .method = routes[i].m,

@@ -1,5 +1,5 @@
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -14,8 +14,6 @@
 static const char* TAG = "main";
 
 void app_main(void) {
-    gpio_init();
-
     esp_err_t e = nvs_flash_init();
     if (e == ESP_ERR_NVS_NO_FREE_PAGES ||
         e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -24,14 +22,21 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(e);
 
+    gpio_init();
+
+    timer_sched_init();
+
+    gpio_set_main_task(xTaskGetCurrentTaskHandle());
+
     tcpip_adapter_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    http_server_start();
+
     wifi_init();
 
-    xEventGroupWaitBits(wifi_get_event_group(), WIFI_CONNECTED_BIT,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
-
-    http_server_start();
-    timer_sched_init();
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        led_update();
+    }
 }

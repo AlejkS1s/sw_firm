@@ -16,9 +16,12 @@ typedef struct {
 
 void timer_sched_init(void);
 bool timer_sched_is_active(void);
+uint32_t timer_sched_remaining(void);
+uint32_t timer_sched_total(void);
 esp_err_t timer_start(uint32_t seconds, bool relay_on);
 void timer_cancel(void);
 
+bool sched_is_any_enabled(void);
 esp_err_t sched_add(const sched_entry_t *entry);
 esp_err_t sched_remove(uint8_t id);
 int sched_get_all(sched_entry_t *entries, int max);
