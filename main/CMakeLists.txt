@@ -1,9 +1,8 @@
 set(COMPONENT_SRCS
     main.c
     gpio.c
-    protocol.c
     wifi.c
-    tcp.c
-    uart.c
+    http_server.c
+    timer_sched.c
 )
 register_component()

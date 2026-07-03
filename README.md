@@ -7,30 +7,25 @@ ESP8266 firmware for a WiFi-controlled relay/switch. Built with ESP-IDF v3.4 (ES
 - **Relay control** via GPIO0 (active-low) — switch AC/DC loads
 - **LED indicator** via GPIO2 (active-low)
 - **WiFi** — connects to saved credentials (NVS), falls back to EspTouch SmartConfig
-- **TCP server** on port 8080 — remote control over LAN
-- **UART interface** on UART0 at 74880 baud — local serial control
+- **HTTP server** on port 80 — JSON API with CORS, one-shot timer, daily schedule engine
+- **LED blink system** — 5 software-defined patterns (on/off/slow/fast/error) via `esp_timer`
 
-## Protocol
+## HTTP API (port 80)
 
-Single-byte commands. On any command the device replies with a 2-byte state.
+| Method | Endpoint              | Body                          | Response                    |
+|--------|-----------------------|-------------------------------|-----------------------------|
+| GET    | `/state`              | —                             | `{"relay":bool,"led":bool,"timer":bool,"timer_rem":0,"time":bool}` |
+| GET    | `/info`               | —                             | `{"mac":"XX:XX:XX:XX:XX:XX"}` |
+| POST   | `/on`                 | —                             | state JSON                  |
+| POST   | `/off`                | —                             | state JSON                  |
+| POST   | `/toggle`             | —                             | state JSON                  |
+| POST   | `/timer`              | `{"s":300,"on":true}`         | state JSON                  |
+| POST   | `/timer/cancel`       | —                             | state JSON                  |
+| GET    | `/schedules`          | —                             | `{"s":[{"i":0,"h":8,"m":0,"o":true,"d":62,"e":true}]}` |
+| POST   | `/schedules`          | `{"h":8,"m":0,"on":true,"d":62}` | `{"ok":true}`           |
+| POST   | `/schedules/remove`   | `{"i":0}`                     | `{"ok":true}`               |
 
-| Byte | Command            |
-|------|--------------------|
-| 0x01 | Relay OFF          |
-| 0x02 | Relay ON           |
-| 0x05 | LED ON             |
-| 0x06 | LED OFF            |
-
-Response format: `[relay_state] [led_state]`
-
-| Byte | State              |
-|------|--------------------|
-| 0xA1 | Relay OFF          |
-| 0xA2 | Relay ON           |
-| 0xB1 | LED OFF            |
-| 0xB2 | LED ON             |
-
-Example: send `0x02` → device replies `0xA2 0xB1` (relay on, led off).
+All POST handlers return the new state after mutation. CORS enabled (`Access-Control-Allow-Origin: *`). `d` (days) is a bitmask: bit0=Sun … bit6=Sat.
 
 ## Build & Flash
 
@@ -41,35 +36,40 @@ make flash PYTHON=/path/to/python
 make monitor PYTHON=/path/to/python
 ```
 
-Default UART: `/dev/ttyUSB0` at 74880 baud (bootloader) / 74880 baud (app console).
+Default flash port: `/dev/ttyUSB0`. Serial console is disabled (CONFIG_LOG_DEFAULT_LEVEL_NONE).
 
 ## Usage
 
-### TCP (over LAN)
-
 ```bash
+# Get state
+curl http://<device-ip>/state
+
 # Relay ON
-echo -n -e '\x02' | nc <device-ip> 8080
+curl -X POST http://<device-ip>/on
 
 # Relay OFF
-echo -n -e '\x01' | nc <device-ip> 8080
+curl -X POST http://<device-ip>/off
 
-# LED ON
-echo -n -e '\x05' | nc <device-ip> 8080
+# Toggle
+curl -X POST http://<device-ip>/toggle
 
-# LED OFF
-echo -n -e '\x06' | nc <device-ip> 8080
-```
+# One-shot timer: turn relay on after 300s
+curl -X POST -d '{"s":300,"on":true}' http://<device-ip>/timer
 
-### UART (serial)
+# Cancel timer
+curl -X POST http://<device-ip>/timer/cancel
 
-```bash
-python3 -c "
-import serial
-s = serial.Serial('/dev/ttyUSB0', 74880)
-s.write(b'\x02')  # relay on
-s.close()
-"
+# Get schedules
+curl http://<device-ip>/schedules
+
+# Add schedule: weekdays 08:00 relay on
+curl -X POST -d '{"h":8,"m":0,"on":true,"d":62}' http://<device-ip>/schedules
+
+# Remove schedule (id from /schedules)
+curl -X POST -d '{"i":0}' http://<device-ip>/schedules/remove
+
+# Get device info (MAC)
+curl http://<device-ip>/info
 ```
 
 ## First-time setup
