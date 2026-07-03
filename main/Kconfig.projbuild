@@ -1,4 +1,4 @@
-menu "Example Configuration"
+menu "SmartConfig Configuration"
 
 choice ESP_SMARTCONFIG_TYPE
 	prompt "Smartconfig Type"
