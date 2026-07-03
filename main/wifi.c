@@ -1,7 +1,9 @@
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -13,12 +15,14 @@
 #include "nvs_flash.h"
 #include "tcpip_adapter.h"
 
+#include "lwip/apps/sntp.h"
+#include "mdns.h"
+
 #include "wifi.h"
+#include "gpio.h"
 
 #define TAG "wifi"
-
 #define MAX_WIFI_RETRY 1
-
 #define NVS_NS  "wifi_creds"
 #define NVS_SSID "ssid"
 #define NVS_PASS "password"
@@ -34,6 +38,7 @@ static EventGroupHandle_t s_evt_grp;
 static esp_timer_handle_t s_sc_timer;
 static wifi_cstate_t s_state = CSTATE_SC_LISTEN;
 static int s_retry = 0;
+static bool s_ack_sent = false;
 
 static void xor_mac(uint8_t* d, size_t n) {
     uint8_t mac[6];
@@ -83,7 +88,9 @@ out:
 static void sc_start(void) {
     s_state = CSTATE_SC_LISTEN;
     s_retry = 0;
+    s_ack_sent = false;
     esp_smartconfig_stop();
+    led_set_pattern(LED_BLINK_FAST);
     ESP_ERROR_CHECK(esp_smartconfig_set_type(CONFIG_ESP_SMARTCONFIG_TYPE));
     smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_smartconfig_start(&cfg));
@@ -92,13 +99,31 @@ static void sc_start(void) {
 
 static void sc_restart(void) {
     esp_smartconfig_stop();
+    led_set_pattern(LED_BLINK_ERROR);
     s_state = CSTATE_SC_LISTEN;
     s_retry = 0;
+    s_ack_sent = false;
     ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, 50000));
 }
 
 static void sc_timer_cb(void* arg) {
     sc_start();
+}
+
+static void ntp_start(void) {
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_set_sync_interval(3600000);
+    sntp_init();
+    ESP_LOGI(TAG, "NTP started");
+}
+
+static void mdns_start(void) {
+    mdns_free();
+    mdns_init();
+    mdns_hostname_set("central");
+    mdns_service_add("ESP8266 Relay", "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS started");
 }
 
 static void handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
@@ -138,14 +163,17 @@ static void handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
                 if (d->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
                     d->reason == WIFI_REASON_AUTH_FAIL) {
                     ESP_LOGW(TAG, "Saved creds invalid (reason %d)", d->reason);
+                    led_set_pattern(LED_BLINK_ERROR);
                     sc_restart();
                 } else if (s_retry < MAX_WIFI_RETRY) {
                     s_retry++;
                     ESP_LOGI(TAG, "Reconnect %d/%d (reason %d)",
                              s_retry, MAX_WIFI_RETRY, d->reason);
+                    led_set_pattern(LED_BLINK_SLOW);
                     esp_wifi_connect();
                 } else {
                     ESP_LOGW(TAG, "Connect failed, fallback to SC");
+                    led_set_pattern(LED_BLINK_ERROR);
                     sc_restart();
                 }
                 break;
@@ -166,14 +194,27 @@ static void handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
                 ESP_LOGI(TAG, "Credentials saved");
             else
                 ESP_LOGE(TAG, "NVS save failed: %s", esp_err_to_name(e));
+            if (s_ack_sent)
+                esp_smartconfig_stop();
         }
 
+        led_set_pattern(LED_OFF);
         s_state = CSTATE_CONNECTED;
         xEventGroupSetBits(s_evt_grp, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "Online");
 
+        ntp_start();
+        mdns_start();
+
     } else if (base == SC_EVENT) {
-        if (id == SC_EVENT_GOT_SSID_PSWD) {
+        if (id == SC_EVENT_SEND_ACK_DONE) {
+            s_ack_sent = true;
+            if (s_state == CSTATE_CONNECTED)
+                esp_smartconfig_stop();
+
+        } else if (id == SC_EVENT_GOT_SSID_PSWD) {
+            if (s_state == CSTATE_SC_VERIFY || s_state == CSTATE_CONNECTED)
+                return;
             smartconfig_event_got_ssid_pswd_t* evt =
                 (smartconfig_event_got_ssid_pswd_t*)data;
 
@@ -198,26 +239,12 @@ static void handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
 
             ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg));
             ESP_ERROR_CHECK(esp_wifi_connect());
-
-        } else if (id == SC_EVENT_SEND_ACK_DONE) {
-            ESP_LOGI(TAG, "ACK delivered to phone");
-            esp_smartconfig_stop();
         }
     }
 }
 
 void wifi_init(void) {
-    esp_err_t e = nvs_flash_init();
-    if (e == ESP_ERR_NVS_NO_FREE_PAGES ||
-        e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        e = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(e);
-
     s_evt_grp = xEventGroupCreate();
-    tcpip_adapter_init();
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
@@ -235,6 +262,7 @@ void wifi_init(void) {
     wifi_config_t saved = {0};
     if (creds_load(&saved) == ESP_OK) {
         s_state = CSTATE_SAVED;
+        led_set_pattern(LED_BLINK_SLOW);
         ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &saved));
         ESP_LOGI(TAG, "Saved credentials loaded");
     }
