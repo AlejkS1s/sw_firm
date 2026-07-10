@@ -1,8 +1,14 @@
 set(COMPONENT_SRCS
     main.c
-    gpio.c
-    wifi.c
+    board.c
+    connection.c
     http_server.c
-    timer_sched.c
+    ipc.c
+    nvs_store.c
+    routines.c
+    timing.c
+    power.c
+    state.c
 )
+set(COMPONENT_REQUIRES json mdns)
 register_component()

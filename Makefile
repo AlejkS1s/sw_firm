@@ -4,6 +4,5 @@
 #
 
 PROJECT_NAME := switch_firm
-
 include $(IDF_PATH)/make/project.mk
 
