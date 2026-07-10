@@ -26,3 +26,29 @@ config ESP_SMARTCONFIG_TYPE
 	default 3 if ESP_TOUCH_V2
 
 endmenu
+
+menu "Button Configuration"
+
+config BUTTON_ENABLE
+	bool "Enable button on GPIO0"
+	default y
+	help
+		GPIO0 as button input with internal pull-up (active-low).
+		Short press toggles relay, long press (5s) triggers
+		WiFi reconnection (SmartConfig).
+
+endmenu
+
+menu "Power Management"
+
+config POWER_IDLE_TIMEOUT
+	int "Idle timeout before modem sleep (seconds)"
+	default 300
+	range 10 86400
+	help
+		Seconds of no HTTP client activity before the ESP8266 enters
+		modem sleep (WIFI_PS_MAX_MODEM). WiFi stays connected and the
+		device continues responding, but radio power consumption drops
+		from ~70mA to ~12mA.
+
+endmenu
