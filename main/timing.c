@@ -13,7 +13,8 @@
 #include "lwip/ip_addr.h"
 
 #include "timing.h"
-#include "ipc.h"
+#include "routines.h"
+#include "state.h"
 
 #define TAG "timing"
 #define MIN_VALID_EPOCH 1000000000
@@ -21,11 +22,10 @@
 #define NTP_HEALTH_CHECK_US 10000000ULL
 #define NTP_HEALTH_MAX_CHECKS 6
 
-/* ── NVS keys ─────────────────────── */
-#define NVS_NS "time"
-#define NVS_KEY_EPOCH "epoch"
-#define NVS_KEY_TZ "tz"
-#define TZ_MAX_LEN 32
+/* ── NTP server (bypasses DNS — use raw IP) ─── */
+#define NTP_SERVER_IP "216.239.35.4"
+
+/* NVS keys live in nvs_store.h */
 
 /* ════════════════════════════════════════════════ *
  *  Static state                                   *
@@ -84,7 +84,7 @@ static void ntp_health_cb(void *arg) {
  * Called once at boot from main(). */
 void timing_init(void) {
     size_t tz_len = sizeof(s_tz);
-    if (nvs_store_get_blob(NVS_NS, NVS_KEY_TZ, s_tz, &tz_len) == ESP_OK && tz_len > 1) {
+    if (nvs_store_get_blob(NVS_NS_TIME, NVS_KEY_TIME_TZ, s_tz, &tz_len) == ESP_OK && tz_len > 1) {
         setenv("TZ", s_tz, 1);
     } else {
         s_tz[0] = '\0';
@@ -92,7 +92,7 @@ void timing_init(void) {
     tzset();
 
     time_t saved_epoch = 0;
-    if (nvs_store_get_u32(NVS_NS, NVS_KEY_EPOCH, (uint32_t*)&saved_epoch) != ESP_OK ||
+    if (nvs_store_get_u32(NVS_NS_TIME, NVS_KEY_TIME_EPOCH, (uint32_t*)&saved_epoch) != ESP_OK ||
         saved_epoch < MIN_VALID_EPOCH) {
         ESP_LOGW(TAG, "No valid saved epoch, using uptime");
     } else {
@@ -112,7 +112,7 @@ void timing_save(void) {
         ESP_LOGW(TAG, "Not saving time: system clock not set");
         return;
     }
-    nvs_store_set_u32(NVS_NS, NVS_KEY_EPOCH, (uint32_t)now);
+    nvs_store_set_u32(NVS_NS_TIME, NVS_KEY_TIME_EPOCH, (uint32_t)now);
     ESP_LOGI(TAG, "Saved epoch=%ld", (long)now);
 }
 
@@ -121,7 +121,11 @@ void timing_save(void) {
  * Notifies the routines task to re-arm its event-scheduled timers. */
 void timing_on_ntp_synced(void) {
     ESP_LOGI(TAG, "Time synced");
-    if (g_routines_task) xTaskNotifyGive(g_routines_task);
+    routines_wake();
+    /* time_ok flips false -> true here and feeds the state hash; without
+     * this, SSE subscribers and /state's ETag wouldn't reflect the sync
+     * until some unrelated event bumped state. */
+    notify_bump_state();
 }
 
 /* ── timing_ntp_start ─────────────────── */
@@ -133,7 +137,7 @@ void timing_ntp_start(void) {
     sntp_stop();
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
     ip_addr_t server;
-    ipaddr_aton("216.239.35.4", &server);
+    ipaddr_aton(NTP_SERVER_IP, &server);
     sntp_setserver(0, &server);
     sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS);
     sntp_set_time_sync_notification_cb(timing_ntp_sync_cb);
@@ -188,5 +192,7 @@ esp_err_t timing_set_timezone(const char *tz) {
     memcpy(s_tz, tz, len + 1);
     setenv("TZ", s_tz, 1);
     tzset();
-    return nvs_store_set_blob(NVS_NS, NVS_KEY_TZ, s_tz, len + 1);
+    esp_err_t e = nvs_store_set_blob(NVS_NS_TIME, NVS_KEY_TIME_TZ, s_tz, len + 1);
+    if (e == ESP_OK) notify_bump_state();
+    return e;
 }

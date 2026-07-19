@@ -1,12 +1,13 @@
 #pragma once
-#include "ipc.h"
+#include <stdbool.h>
+#include <stdint.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+
+#define WIFI_CONNECTED_BIT  BIT0
+
+void connection_init(void);
 void wifi_init(void);
 void wifi_reconnect(void);
-
-/* Net task: starts NTP on WiFi connect, processes reconnect requests. */
-void net_task(void *arg);
-
-/* Request a WiFi re-provision (clears creds, enters SmartConfig). Safe to
- * call from any context — posts to the net queue. */
-void net_reconnect_request(void);
+bool wifi_is_connected(void);
