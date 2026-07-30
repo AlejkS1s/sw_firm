@@ -37,6 +37,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  routine_count;
     uint8_t  routine_ids[12];   /* ROUTINES_MAX = 12 */
     char     tz[TZ_MAX_LEN];
+    uint8_t  sse_enabled;       /* 1 = SSE active, 0 = disabled */
     uint32_t countdown_rem;     /* excluded from the hash — see note above */
 } state_snapshot_t;
 

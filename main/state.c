@@ -12,6 +12,7 @@
 #include "countdown.h"
 #include "power.h"
 #include "routines.h"
+#include "sse.h"
 #include "state.h"
 #include "timing.h"
 #include "http_util.h"
@@ -88,6 +89,8 @@ void state_snapshot_build(state_snapshot_t *s) {
 
     strncpy(s->tz, timing_get_timezone(), TZ_MAX_LEN - 1);
 
+    s->sse_enabled = sse_is_enabled() ? 1 : 0;
+
     s->countdown_rem = countdown_get_remaining();  /* last: see STATE_HASH_LEN */
 }
 
@@ -144,7 +147,8 @@ size_t state_build_json(char *buf, size_t buflen) {
         "\"countdown_total\":%lu,\"cd_target_epoch\":%lu,"
         "\"boot_mode\":%d,\"led_mode\":%d,"
         "\"routine_mask\":%d,"
-        "\"auto_off\":{\"armed\":%s,\"h\":%d,\"m\":%d,\"s\":%d}}",
+        "\"auto_off\":{\"armed\":%s,\"h\":%d,\"m\":%d,\"s\":%d},"
+        "\"sse_enabled\":%s}",
         BOOL_STR(snap->relay),
         BOOL_STR(snap->led),
         BOOL_STR(snap->countdown_active),
@@ -154,7 +158,8 @@ size_t state_build_json(char *buf, size_t buflen) {
         snap->boot_mode,
         snap->led_mode,
         snap->routine_active_mask,
-        BOOL_STR(snap->auto_off_armed), snap->auto_off_h, snap->auto_off_m, snap->auto_off_s);
+        BOOL_STR(snap->auto_off_armed), snap->auto_off_h, snap->auto_off_m, snap->auto_off_s,
+        BOOL_STR(snap->sse_enabled));
 
     return snprintf_guard(n, buflen);
 }
@@ -174,8 +179,8 @@ void state_init(void) {
 /* ══════════════════════════════════════════════════════════════════════════
  * SSE data encoding — single-token base64-encoded binary for minimum traffic.
  *
- * Full state (12 bytes → 16 base64 chars):
- *   f<base64>   e.g. f4YGQAA... (16 chars)
+ * Full state (13 bytes → 18 base64 chars):
+ *   f<base64>   e.g. f4YGQAA... (18 chars)
  *
  *   Byte 0: [relay:1][led:1][cd_active:1][time_ok:1][boot_mode:2][spare:2]
  *   Byte 1: [led_mode:7][power_save_disabled:1]
@@ -184,6 +189,7 @@ void state_init(void) {
  *   Byte 9: [routine_active_mask:2][auto_off_armed:1][auto_off_h:5]
  *   Byte 10: auto_off_m
  *   Byte 11: auto_off_s
+ *   Byte 12: sse_enabled (0/1)
  *
  * Delta:
  *   d<base64>   e.g. dAQB (relay toggled on: mask 0x0001, val 01)
@@ -197,10 +203,11 @@ void state_init(void) {
  *     bit 5(time_ok), 6(boot), 7(led_mode)         → 1 byte each
  *     bit 8(power_save), 9(rmask)                  → 1 byte each
  *     bit 10(armed), 11(aoff_h), 12(aoff_m), 13(aoff_s) → 1 byte each
+ *     bit 14(sse_enabled)                          → 1 byte
  *
  * e.g. relay + led toggling together costs mask(2) + 1 + 1 = 4 bytes, not
  * a shared 1 — worth knowing if you're reasoning about worst-case delta
- * size (max 14 fields × their byte widths + 2-byte mask = 21 bytes).
+ * size (max 15 fields × their byte widths + 2-byte mask = 22 bytes).
  *
  * Countdown remaining time is NOT sent — the client derives it from
  * cd_target_epoch and its own clock. This eliminates the 60 deltas/min
@@ -230,8 +237,8 @@ static void base64_enc(const uint8_t *in, size_t inlen, char *out) {
     }
 }
 
-/* Encode a full snapshot into the 12-byte binary format. */
-static void snap_encode_bin(const state_snapshot_t *s, uint8_t out[12]) {
+/* Encode a full snapshot into the 13-byte binary format. */
+static void snap_encode_bin(const state_snapshot_t *s, uint8_t out[13]) {
     out[0] = (uint8_t)(
         ((s->relay              & 1) << 7) |
         ((s->led                & 1) << 6) |
@@ -257,6 +264,7 @@ static void snap_encode_bin(const state_snapshot_t *s, uint8_t out[12]) {
     );
     out[10] = s->auto_off_m;
     out[11] = s->auto_off_s;
+    out[12] = s->sse_enabled;
 }
 
 /* Build the SSE data line — a single token: f<base64> for full, d<base64>
@@ -267,14 +275,14 @@ size_t state_build_ssedata(char *buf, size_t buflen,
     if (buflen < 3) return 0;
 
     if (!prev) {
-        /* Full state: 12 bytes → 16 base64 chars */
-        if (buflen < 18) return 0;  /* f + 16 + NUL */
-        uint8_t bin[12];
+        /* Full state: 13 bytes → 18 base64 chars */
+        if (buflen < 20) return 0;  /* f + 18 + NUL */
+        uint8_t bin[13];
         snap_encode_bin(cur, bin);
         buf[0] = 'f';
-        base64_enc(bin, 12, buf + 1);
-        buf[17] = '\0';
-        return 17;
+        base64_enc(bin, 13, buf + 1);
+        buf[19] = '\0';
+        return 19;
     }
 
     /* Delta: [mask_hi][mask_lo][changed-field values...]. Built directly
@@ -305,6 +313,7 @@ size_t state_build_ssedata(char *buf, size_t buflen,
     if (prev->auto_off_h          != cur->auto_off_h)          { CHECK_BIT(0x0800, cur->auto_off_h, 1); }
     if (prev->auto_off_m          != cur->auto_off_m)          { CHECK_BIT(0x1000, cur->auto_off_m, 1); }
     if (prev->auto_off_s          != cur->auto_off_s)          { CHECK_BIT(0x2000, cur->auto_off_s, 1); }
+    if (prev->sse_enabled         != cur->sse_enabled)         { CHECK_BIT(0x4000, cur->sse_enabled, 1); }
 
 #undef CHECK_BIT
 

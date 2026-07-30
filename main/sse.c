@@ -1,18 +1,27 @@
 #include <string.h>
+#include <errno.h>
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "sse.h"
 #include "power.h"
 #include "state.h"
+#include "nvs_store.h"
 #include "http_util.h"
 
-#define SSE_MAX_CLIENTS 2
+#define TAG "sse"
+#define SSE_SEND_TIMEOUT_S  2
+#define SSE_HEARTBEAT_US    5000000
+#define SSE_STALE_MS        15000
+#define SSE_MAX_CLIENTS     2
 
 typedef struct {
     int            fd;
     httpd_handle_t handle;
     bool           active;
     char           client_id[SSE_CLIENT_ID_MAX_LEN];
+    uint32_t       last_activity_ms;
 } sse_client_t;
 
 static sse_client_t s_clients[SSE_MAX_CLIENTS];
@@ -20,11 +29,137 @@ static volatile bool s_push_pending = false;
 static state_snapshot_t s_last_snapshot;
 static bool s_has_snapshot = false;
 
-void sse_init(void) {
-    state_register_on_change(sse_notify);
+static unsigned s_unique_fds = 0;
+
+static bool s_sse_enabled = true;
+
+static esp_timer_handle_t s_heartbeat_timer;
+static bool s_heartbeat_running = false;
+
+static void sse_heartbeat_cb(void *arg);
+static void sse_heartbeat_start(void);
+static void sse_heartbeat_stop(void);
+
+/* Helper: true if slot j is the only active slot referencing slot i's fd. */
+static bool sse_is_last_ref(int i) {
+    int j = i ^ 1;
+    return !s_clients[j].active || s_clients[j].fd != s_clients[i].fd;
 }
 
-/* Extract a query parameter value from a URI string. Returns true if found. */
+static void sse_deactivate_slot(int i) {
+    if (!s_clients[i].active) return;
+    ESP_LOGI(TAG, "deactivate slot=%d fd=%d id=%s", i, s_clients[i].fd, s_clients[i].client_id);
+    bool last = sse_is_last_ref(i);
+    s_clients[i].active = false;
+    s_clients[i].client_id[0] = '\0';
+    if (last) {
+        power_sse_client_disconnected();
+        if (s_unique_fds > 0) s_unique_fds--;
+    }
+}
+
+unsigned sse_client_count(void) { return s_unique_fds; }
+
+static uint32_t now_ms(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+void sse_init(void) {
+    state_register_on_change(sse_notify);
+    uint8_t v = 1;
+    if (nvs_store_get_u8(NVS_NS_SSE, NVS_KEY_SSE_ENABLED, &v) == ESP_OK)
+        s_sse_enabled = (v != 0);
+    esp_timer_create_args_t args = { .callback = sse_heartbeat_cb, .name = "sse_hb" };
+    esp_timer_create(&args, &s_heartbeat_timer);
+}
+
+void sse_set_enabled(bool enabled) {
+    if (enabled == s_sse_enabled) return;
+    s_sse_enabled = enabled;
+    nvs_store_set_u8(NVS_NS_SSE, NVS_KEY_SSE_ENABLED, enabled ? 1 : 0);
+    ESP_LOGI(TAG, "SSE %s", enabled ? "enabled" : "disabled");
+    if (!enabled)
+        sse_close_all();
+    notify_bump_state();
+}
+
+bool sse_is_enabled(void) { return s_sse_enabled; }
+
+void sse_close_all(void) {
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++)
+        sse_deactivate_slot(i);
+    sse_heartbeat_stop();
+}
+
+/* ── Heartbeat ────────────────────────────────────────────────────────── */
+
+static void sse_heartbeat_cb(void *arg) {
+    (void)arg;
+    if (s_unique_fds == 0) { sse_heartbeat_stop(); return; }
+
+    uint32_t now = now_ms();
+    time_t t = time(NULL);
+
+    /* Build combined chunk once: [hex-len\r\n][SSE event][\r\n] */
+    char buf[128];
+    int datalen = snprintf(buf + 12, sizeof(buf) - 12,
+        "id: %lu\nevent: heartbeat\ndata: %ld\n\n",
+        (unsigned long)g_state_version, (long)t);
+    if (datalen < 0 || (size_t)(datalen + 12 + 2) > sizeof(buf)) return;
+    int hdrlen = snprintf(buf, 12, "%x\r\n", datalen);
+    if (hdrlen < 0 || hdrlen >= 12) return;
+
+    /* Compact: move SSE event from reserve slot (buf+12) right after the
+     * hex-length header, then append the trailing chunk CRLF. */
+    int gap = 12 - hdrlen;
+    if (gap > 0)
+        memmove(buf + hdrlen, buf + 12, (size_t)datalen);
+    int total = hdrlen + datalen;
+    buf[total] = '\r';
+    buf[total + 1] = '\n';
+
+    /* Single pass: evict stale clients, send heartbeat to survivors. */
+    int last_fd = -1;
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+        if (!s_clients[i].active) continue;
+        if (now - s_clients[i].last_activity_ms > SSE_STALE_MS) {
+            ESP_LOGW(TAG, "evicting stale slot=%d fd=%d (no activity for %lu s)",
+                     i, s_clients[i].fd,
+                     (unsigned long)((now - s_clients[i].last_activity_ms) / 1000));
+            sse_deactivate_slot(i);
+            continue;
+        }
+        if (s_clients[i].fd == last_fd) continue;
+        last_fd = s_clients[i].fd;
+
+        int ret = send(s_clients[i].fd, buf, total + 2, 0);
+        if (ret == total + 2) {
+            s_clients[i].last_activity_ms = now;
+        } else {
+            ESP_LOGW(TAG, "hb send failed fd=%d ret=%d errno=%d", s_clients[i].fd, ret, errno);
+            sse_deactivate_slot(i);
+        }
+    }
+
+    if (s_unique_fds == 0)
+        sse_heartbeat_stop();
+}
+
+static void sse_heartbeat_start(void) {
+    if (s_heartbeat_running || !s_sse_enabled) return;
+    if (esp_timer_start_periodic(s_heartbeat_timer, SSE_HEARTBEAT_US) == ESP_OK) {
+        s_heartbeat_running = true;
+    }
+}
+
+static void sse_heartbeat_stop(void) {
+    if (!s_heartbeat_running) return;
+    esp_timer_stop(s_heartbeat_timer);
+    s_heartbeat_running = false;
+}
+
+/* ── Registration ─────────────────────────────────────────────────────── */
+
 static bool get_query_param(const char *uri, const char *key, char *out, size_t outlen) {
     if (!uri) return false;
     const char *q = strchr(uri, '?');
@@ -47,108 +182,141 @@ static bool get_query_param(const char *uri, const char *key, char *out, size_t 
     return false;
 }
 
+static void set_send_timeout(int fd) {
+    struct timeval tv = { .tv_sec = SSE_SEND_TIMEOUT_S, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* Activate slot i with the given fd and client_id. Handles power and fd
+ * tracking — called once a target slot is determined. */
+static bool sse_activate_slot(int i, int fd, httpd_handle_t handle,
+                               const char *client_id, uint32_t now) {
+    bool is_new_fd = true;
+    int j = i ^ 1;
+    if (s_clients[j].active && s_clients[j].fd == fd)
+        is_new_fd = false;
+
+    s_clients[i].fd        = fd;
+    s_clients[i].handle    = handle;
+    s_clients[i].active    = true;
+    s_clients[i].last_activity_ms = now;
+    strncpy(s_clients[i].client_id, client_id, SSE_CLIENT_ID_MAX_LEN - 1);
+    s_clients[i].client_id[SSE_CLIENT_ID_MAX_LEN - 1] = '\0';
+
+    set_send_timeout(fd);
+    if (is_new_fd) {
+        s_unique_fds++;
+        power_sse_client_connected();
+    }
+    sse_heartbeat_start();
+    return true;
+}
+
 bool sse_register(httpd_req_t *req) {
+    if (!s_sse_enabled) {
+        ESP_LOGW(TAG, "registration rejected: SSE disabled");
+        return false;
+    }
+
     int fd = httpd_req_to_sockfd(req);
     httpd_handle_t handle = req->handle;
-
     char client_id[SSE_CLIENT_ID_MAX_LEN] = "";
     get_query_param(req->uri, "client_id", client_id, sizeof(client_id));
 
-    /* First pass: find a free slot. */
+    /* Single scan: find replace slot, free slot, or candidate for eviction. */
+    int replace_idx = -1, free_idx = -1;
     for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
-        if (!s_clients[i].active) {
-            s_clients[i].fd        = fd;
-            s_clients[i].handle    = handle;
-            s_clients[i].active    = true;
-            strncpy(s_clients[i].client_id, client_id, SSE_CLIENT_ID_MAX_LEN - 1);
-            s_clients[i].client_id[SSE_CLIENT_ID_MAX_LEN - 1] = '\0';
-            power_sse_client_connected();
-            return true;
-        }
+        if (s_clients[i].active && s_clients[i].fd == fd)
+            replace_idx = i;
+        else if (!s_clients[i].active)
+            free_idx = i;
     }
 
-    /* All slots full — probe each active client's socket to detect stale
-     * (disconnected) entries left over from page refresh / reconnect.
-     * recv() with MSG_PEEK | MSG_DONTWAIT returns 0 on graceful close
-     * (EOF) or -1 on error (socket already reclaimed by httpd). */
+    if (replace_idx >= 0) {
+        ESP_LOGI(TAG, "replacing existing slot=%d fd=%d", replace_idx, fd);
+        return sse_activate_slot(replace_idx, fd, handle, client_id, now_ms());
+    }
+
+    if (free_idx >= 0) {
+        ESP_LOGI(TAG, "client registered slot=%d fd=%d id=%s", free_idx, fd, client_id);
+        return sse_activate_slot(free_idx, fd, handle, client_id, now_ms());
+    }
+
+    /* Both slots full — probe each for stale disconnect. */
     for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
         char c;
-        int ret = recv(s_clients[i].fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (ret <= 0) {
-            s_clients[i].fd        = fd;
-            s_clients[i].handle    = handle;
-            s_clients[i].active    = true;
-            strncpy(s_clients[i].client_id, client_id, SSE_CLIENT_ID_MAX_LEN - 1);
-            s_clients[i].client_id[SSE_CLIENT_ID_MAX_LEN - 1] = '\0';
-            /* power count unchanged — one stale client swapped */
-            return true;
+        if (recv(s_clients[i].fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) <= 0) {
+            sse_deactivate_slot(i);
+            ESP_LOGI(TAG, "client registered (evict) slot=%d fd=%d id=%s", i, fd, client_id);
+            return sse_activate_slot(i, fd, handle, client_id, now_ms());
         }
     }
 
+    ESP_LOGW(TAG, "registration rejected: all %d slots full, fd=%d", SSE_MAX_CLIENTS, fd);
     return false;
 }
 
-unsigned sse_client_count(void) {
-    unsigned count = 0;
-    for (int i = 0; i < SSE_MAX_CLIENTS; i++)
-        if (s_clients[i].active) count++;
-    return count;
-}
+/* ── Push ─────────────────────────────────────────────────────────────── */
 
 static void sse_push_work(void *arg) {
     (void)arg;
 
-    state_snapshot_t cur;
-    state_snapshot_build(&cur);
+    state_snapshot_t cur = *state_get_snapshot();
 
-    char buf[JSON_BUF_SIZE + 64];
-    int off = snprintf(buf, sizeof(buf),
+    char buf[JSON_BUF_SIZE + 112];
+    int off = 12 + snprintf(buf + 12, sizeof(buf) - 12,
         "id: %lu\nevent: state\ndata: ", (unsigned long)g_state_version);
-    if (off < 0 || (size_t)off >= sizeof(buf)) { s_push_pending = false; return; }
+    if (off < 12 || (size_t)off >= sizeof(buf)) { s_push_pending = false; return; }
 
     size_t slen = state_build_ssedata(buf + off, sizeof(buf) - off,
                                        s_has_snapshot ? &s_last_snapshot : NULL, &cur);
+    if (slen == 0) { s_push_pending = false; return; }
     s_last_snapshot = cur;
     s_has_snapshot = true;
-
-    if (slen == 0) { s_push_pending = false; return; }
     off += (int)slen;
+
     int n = snprintf(buf + off, sizeof(buf) - off, "\n\n");
     if (n < 0) { s_push_pending = false; return; }
     off += n;
 
-    char hdr[16];
-    int hdr_len = snprintf(hdr, sizeof(hdr), "%x\r\n", off);
+    int datalen = off - 12;
+    int hdrlen = snprintf(buf, 12, "%x\r\n", datalen);
+    if (hdrlen < 0 || hdrlen >= 12) { s_push_pending = false; return; }
 
+    int gap = 12 - hdrlen;
+    if (gap > 0)
+        memmove(buf + hdrlen, buf + 12, (size_t)(off - 12));
+    off = hdrlen + datalen;
+    buf[off] = '\r';
+    buf[off + 1] = '\n';
+
+    uint32_t now = now_ms();
     for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
         if (!s_clients[i].active) continue;
-        if (send(s_clients[i].fd, hdr, hdr_len, 0) < 0 ||
-            send(s_clients[i].fd, buf, off, 0) < 0 ||
-            send(s_clients[i].fd, "\r\n", 2, 0) < 0) {
-            s_clients[i].active = false;
-            s_clients[i].client_id[0] = '\0';
-            power_sse_client_disconnected();
+        int ret = send(s_clients[i].fd, buf, off + 2, 0);
+        if (ret == off + 2) {
+            s_clients[i].last_activity_ms = now;
+        } else {
+            ESP_LOGW(TAG, "push failed slot=%d fd=%d, disconnecting", i, s_clients[i].fd);
+            sse_deactivate_slot(i);
         }
     }
+
+    if (s_unique_fds == 0)
+        sse_heartbeat_stop();
     s_push_pending = false;
 }
 
 void sse_notify(void) {
-    if (s_push_pending) return;
+    if (s_push_pending) { return; }
     s_push_pending = true;
 
     httpd_handle_t handle = NULL;
     for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
-        if (s_clients[i].active) {
-            handle = s_clients[i].handle;
-            break;
-        }
+        if (s_clients[i].active) { handle = s_clients[i].handle; break; }
     }
-    if (!handle) {
-        s_push_pending = false;
-        return;
-    }
-    esp_err_t e = httpd_queue_work(handle, sse_push_work, NULL);
-    if (e != ESP_OK)
+    if (!handle) { s_push_pending = false; return; }
+
+    if (httpd_queue_work(handle, sse_push_work, NULL) != ESP_OK)
         s_push_pending = false;
 }
