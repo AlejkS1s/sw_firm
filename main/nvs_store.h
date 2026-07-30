@@ -21,6 +21,7 @@
 #define NVS_NS_TIME        "time"
 #define NVS_NS_DIAG        "diag"
 #define NVS_NS_POWER       "power"
+#define NVS_NS_SSE         "sse"
 
 /* ── Keys — relay namespace ───────────────────────────────────────────── */
 #define NVS_KEY_RELAY_STATE    "state"
@@ -50,6 +51,9 @@
 
 /* ── Keys — power namespace ───────────────────────────────────────────── */
 #define NVS_KEY_POWER_SAVE     "ps_off"
+
+/* ── Keys — sse namespace ────────────────────────────────────────────── */
+#define NVS_KEY_SSE_ENABLED    "enabled"
 
 /* ══════════════════════════════════════════════════════════════════════════ */
 

@@ -1,12 +1,16 @@
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_log.h"
 
 #include "nvs_store.h"
+
+#define TAG "nvs"
 
 #define NVS_READ(ns, expr) ({ \
     nvs_handle_t _h; \
     esp_err_t _e = nvs_open(ns, NVS_READONLY, &_h); \
     if (_e == ESP_OK) { _e = (expr); nvs_close(_h); } \
+    if (_e != ESP_OK) ESP_LOGW(TAG, "read %s failed: %s", ns, esp_err_to_name(_e)); \
     _e; \
 })
 
@@ -18,6 +22,7 @@
         if (_e == ESP_OK) _e = nvs_commit(_h); \
         nvs_close(_h); \
     } \
+    if (_e != ESP_OK) ESP_LOGW(TAG, "write %s failed: %s", ns, esp_err_to_name(_e)); \
     _e; \
 })
 

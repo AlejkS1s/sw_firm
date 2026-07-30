@@ -44,6 +44,9 @@ void power_set_save_disabled(bool disabled) {
         s_last_activity_us = esp_timer_get_time();
         taskEXIT_CRITICAL();
         esp_wifi_set_ps(WIFI_PS_NONE);
+        ESP_LOGI(TAG, "power-save disabled (forced active)");
+    } else {
+        ESP_LOGI(TAG, "power-save enabled (idle timeout %lus)", (unsigned long)s_idle_timeout_s);
     }
     /* Re-enabling doesn't force sleep immediately — that stays
      * power_process()'s decision, based on idle time and SSE subscribers,
@@ -86,6 +89,7 @@ void power_init(void) {
         s_save_disabled = (v != 0);
 
     esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "init: timeout=%lus, save_disabled=%d", (unsigned long)s_idle_timeout_s, s_save_disabled);
 }
 
 void power_notify_activity(void) {
@@ -105,6 +109,7 @@ void power_process(void) {
         s_active = true;
         taskEXIT_CRITICAL();
         esp_wifi_set_ps(WIFI_PS_NONE);
+        ESP_LOGD(TAG, "transition -> ACTIVE (pending)");
         return;
     }
     bool cur_active = s_active;
@@ -119,6 +124,7 @@ void power_process(void) {
     if (now - last_act > (int64_t)s_idle_timeout_s * (int64_t)USEC_PER_SEC) {
         s_active = false;
         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+        ESP_LOGI(TAG, "transition -> IDLE (modem sleep, timeout=%lus)", (unsigned long)s_idle_timeout_s);
     }
 }
 

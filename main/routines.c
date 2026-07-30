@@ -66,8 +66,18 @@ static esp_err_t routines_nvs_save(void) {
 static void routines_nvs_load(void) {
     size_t sz = sizeof(s_slots);
     if (nvs_store_get_blob(NVS_NS_ROUTINES, NVS_KEY_ROUTINE_SLOTS,
-                           s_slots, &sz) != ESP_OK)
+                           s_slots, &sz) != ESP_OK) {
         memset(s_slots, 0, sizeof(s_slots));
+        return;
+    }
+    /* If blob size doesn't match current struct layout (e.g. after upgrading
+     * from older firmware), invalidate all slots to avoid misinterpreting
+     * old bytes as the new date_start/date_end fields. */
+    if (sz != sizeof(s_slots)) {
+        ESP_LOGW(TAG, "slot blob size mismatch (%u vs %u), clearing",
+                 (unsigned)sz, (unsigned)sizeof(s_slots));
+        memset(s_slots, 0, sizeof(s_slots));
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -95,10 +105,65 @@ static time_t next_weekday_time(int hour, int minute, int days, time_t now) {
     return -1;
 }
 
-bool circulate_in_window_for_entry(const routine_entry_t *e, time_t now, time_t *out_end) {
+/* ── Date helpers ─────────────────────────────────────────────────────── */
+
+/* Encode today's local date as YYYYMMDD (e.g. 20260725). */
+uint32_t date_today_ymd(void) {
+    time_t now = time(NULL);
     struct tm tmv;
     localtime_r(&now, &tmv);
-    if (!(e->days & (1 << tmv.tm_wday))) return false;
+    return (uint32_t)((tmv.tm_year + 1900) * 10000 +
+                      (tmv.tm_mon + 1) * 100 + tmv.tm_mday);
+}
+
+/* Extract weekday (0=Sun..6=Sat) from a YYYYMMDD value.
+ * Uses mktime to let the C library compute the day-of-week. */
+static int ymd_weekday(uint32_t ymd) {
+    int y = (int)(ymd / 10000);
+    int m = (int)((ymd / 100) % 100);
+    int d = (int)(ymd % 100);
+    struct tm t = { .tm_year = y - 1900, .tm_mon = m - 1, .tm_mday = d,
+                    .tm_hour = 12, .tm_isdst = -1 };
+    mktime(&t);
+    return t.tm_wday;
+}
+
+/* Check if today falls within the date range of a circulate entry.
+ * Returns true if the entry's date restriction is satisfied. */
+static bool circulate_date_matches(const routine_entry_t *e) {
+    if (e->date_start == CIRC_DATE_NONE) return true;  /* no date restriction */
+    uint32_t today = date_today_ymd();
+    if (today < e->date_start || today > e->date_end) return false;
+    /* Date range matches — now check weekday filter if days != 0 */
+    if (e->days != 0) {
+        int wday = ymd_weekday(today);
+        if (!(e->days & (1 << wday))) return false;
+    }
+    return true;
+}
+
+/* Check if today is past the end of a one-time or range date.
+ * Used to detect expired entries for auto-deletion. */
+static bool circulate_date_expired(const routine_entry_t *e) {
+    if (e->date_start == CIRC_DATE_NONE) return false;
+    uint32_t today = date_today_ymd();
+    return today > e->date_end;
+}
+
+bool circulate_in_window_for_entry(const routine_entry_t *e, time_t now, time_t *out_end) {
+    /* Date restriction check (applies before weekday/time checks) */
+    if (!circulate_date_matches(e)) return false;
+
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+
+    /* If no date is set and weekday filter is active, check weekday.
+     * If date is set, weekday was already checked in circulate_date_matches().
+     * If days == 0 (no filter), skip weekday check entirely. */
+    if (e->date_start == CIRC_DATE_NONE && e->days != 0 &&
+        !(e->days & (1 << tmv.tm_wday)))
+        return false;
+
     int start_min = e->hour * MIN_PER_HOUR + e->minute;
     int end_min   = e->end_hour * MIN_PER_HOUR + e->end_minute;
     int cur_min   = tmv.tm_hour * MIN_PER_HOUR + tmv.tm_min;
@@ -115,6 +180,58 @@ bool circulate_in_window_for_entry(const routine_entry_t *e, time_t now, time_t 
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * Overlap check
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+bool circulate_overlaps(const routine_entry_t *entry, int exclude_idx) {
+    int new_start = entry->hour * MIN_PER_HOUR + entry->minute;
+    int new_end   = entry->end_hour * MIN_PER_HOUR + entry->end_minute;
+
+    for (int i = 0; i < ROUTINES_MAX; i++) {
+        if (i == exclude_idx) continue;
+        if (!s_slots[i].in_use || s_slots[i].type != RT_CIRCULATE) continue;
+
+        const routine_entry_t *exist = &s_slots[i];
+
+        /* Different date ranges cannot overlap */
+        if (entry->date_start != exist->date_start ||
+            entry->date_end   != exist->date_end)
+            continue;
+
+        /* days=0 means "any weekday" — skip the weekday intersection check
+         * for either side being 0 (they overlap on every matching day) */
+        if (entry->days != 0 && exist->days != 0 &&
+            !(entry->days & exist->days))
+            continue;
+
+        /* Check time window overlap: max(start) < min(end) */
+        int exist_start = exist->hour * MIN_PER_HOUR + exist->minute;
+        int exist_end   = exist->end_hour * MIN_PER_HOUR + exist->end_minute;
+        if (new_start < exist_end && exist_start < new_end)
+            return true;
+    }
+    return false;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Expired entry cleanup (auto-delete one-time/range dates after expiry)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static void circulate_cleanup_expired(void) {
+    for (int i = 0; i < ROUTINES_MAX; i++) {
+        if (!s_slots[i].in_use || s_slots[i].type != RT_CIRCULATE) continue;
+        if (circulate_date_expired(&s_slots[i])) {
+            ESP_LOGI(TAG, "auto-deleting expired slot %d (date_end=%lu)",
+                     i, (unsigned long)s_slots[i].date_end);
+            memset(&s_slots[i], 0, sizeof(s_slots[i]));
+            s_last_toggle_epoch[i] = 0;
+            s_circ_phase[i] = false;
+            s_dirty = true;
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Per-slot fire time
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -125,17 +242,72 @@ static time_t slot_next_fire(int i, time_t now) {
     if (e->type == RT_SCHEDULE)
         return next_weekday_time(e->hour, e->minute, e->days, now);
 
-    /* circulate — compute window end */
+    /* circulate — check date expiry first */
+    if (circulate_date_expired(e)) return -1;
+
     struct tm tmv;
     localtime_r(&now, &tmv);
     int start_min = e->hour * MIN_PER_HOUR + e->minute;
-    int end_min   = e->end_hour * MIN_PER_HOUR + e->end_minute;
-    int cur_min   = tmv.tm_hour * MIN_PER_HOUR + tmv.tm_min;
-    bool in_win   = (e->days & (1 << tmv.tm_wday)) &&
-                    cur_min >= start_min && cur_min < end_min;
 
-    if (!in_win)
+    /* Check if in window (date + weekday + time-of-day) */
+    bool in_win = circulate_in_window_for_entry(e, now, NULL);
+
+    if (!in_win) {
+        /* Not in window — find next matching window start.
+         * For date-restricted entries, only search within the date range. */
+        if (e->date_start != CIRC_DATE_NONE) {
+            uint32_t today = date_today_ymd();
+            if (today > e->date_end) return -1;  /* expired */
+
+            if (e->days != 0) {
+                /* Has weekday filter — use next_weekday_time */
+                time_t t = next_weekday_time(e->hour, e->minute, e->days, now);
+                if (t < 0) return -1;
+                struct tm ctv;
+                localtime_r(&t, &ctv);
+                uint32_t cand_ymd = (uint32_t)((ctv.tm_year + 1900) * 10000 +
+                                               (ctv.tm_mon + 1) * 100 + ctv.tm_mday);
+                if (cand_ymd < e->date_start || cand_ymd > e->date_end) return -1;
+                return t;
+            } else {
+                /* days=0: "any weekday" — just check if window is still
+                 * ahead today, or schedule for tomorrow within range */
+                int cur_min = tmv.tm_hour * MIN_PER_HOUR + tmv.tm_min;
+                if (today >= e->date_start && today <= e->date_end) {
+                    /* Today is in range — if window is ahead, schedule it */
+                    if (cur_min < start_min) {
+                        struct tm svc = tmv;
+                        svc.tm_hour = e->hour;
+                        svc.tm_min  = e->minute;
+                        svc.tm_sec  = 0;
+                        svc.tm_isdst = -1;
+                        return mktime(&svc);
+                    }
+                    /* Window already started or passed — if we're in the
+                     * window, slot_next_fire will be called again and the
+                     * in_win path handles it. If past, nothing to do today. */
+                }
+                /* Not today — find next day in range (just tomorrow) */
+                if (today < e->date_end) {
+                    struct tm tomorrow = tmv;
+                    tomorrow.tm_mday += 1;
+                    tomorrow.tm_isdst = -1;
+                    mktime(&tomorrow);
+                    uint32_t next_ymd = (uint32_t)((tomorrow.tm_year + 1900) * 10000 +
+                                                   (tomorrow.tm_mon + 1) * 100 + tomorrow.tm_mday);
+                    if (next_ymd >= e->date_start && next_ymd <= e->date_end) {
+                        tomorrow.tm_hour = e->hour;
+                        tomorrow.tm_min  = e->minute;
+                        tomorrow.tm_sec  = 0;
+                        tomorrow.tm_isdst = -1;
+                        return mktime(&tomorrow);
+                    }
+                }
+                return -1;
+            }
+        }
         return next_weekday_time(e->hour, e->minute, e->days, now);
+    }
 
     if (s_last_toggle_epoch[i] == 0) return now;
     int interval = s_circ_phase[i] ? e->interval_on : e->interval_off;
@@ -155,7 +327,10 @@ static time_t slot_next_fire(int i, time_t now) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 static void fire_due(time_t now) {
+    bool dirty;
     LOCK_GUARD(g_routines_mutex) {
+        circulate_cleanup_expired();
+
         for (int i = 0; i < ROUTINES_MAX; i++) {
             if (!s_slots[i].in_use) continue;
             time_t t = slot_next_fire(i, now);
@@ -181,19 +356,25 @@ static void fire_due(time_t now) {
                     on = s_circ_phase[i];
                 }
             }
-            relay_set_async(on);
+            relay_set(on);
             ESP_LOGI(TAG, "fired slot %d type=%d -> %s",
                      i, s_slots[i].type, RELAY_STR(on));
         }
-        if (s_dirty) { routines_nvs_save(); s_dirty = false; }
+        dirty = s_dirty;
+        s_dirty = false;
     }
+    if (dirty) routines_nvs_save();
 }
 
 static void routines_sync(void) {
+    bool dirty;
     LOCK_GUARD(g_routines_mutex) {
         s_time_ok = true;
-        if (s_dirty) { routines_nvs_save(); s_dirty = false; }
+        dirty = s_dirty;
+        s_dirty = false;
     }
+    if (dirty) routines_nvs_save();
+    timing_save();
     refresh_active_mask();
     ESP_LOGI(TAG, "Time synced, routines active");
 }
@@ -252,8 +433,46 @@ void routines_task(void *arg) {
 
 routine_handle_t routine_create(uint8_t type, const routine_entry_t *params) {
     if (type != RT_SCHEDULE && type != RT_CIRCULATE) return NULL;
+    if (relay_auto_off_is_armed()) return NULL;
     if (type == RT_CIRCULATE && (params->interval_on == 0 || params->interval_off == 0))
         return NULL;
+
+    /* Circulate validations (pre-lock) */
+    if (type == RT_CIRCULATE) {
+        int smin = params->hour * MIN_PER_HOUR + params->minute;
+        int emin = params->end_hour * MIN_PER_HOUR + params->end_minute;
+        if (smin >= emin) return NULL;
+
+        if (params->date_start != CIRC_DATE_NONE &&
+            params->date_start > params->date_end)
+            return NULL;
+
+        /* If date + days mask both set, verify at least one day in range matches */
+        if (params->date_start != CIRC_DATE_NONE && params->days != 0) {
+            bool any_match = false;
+            uint32_t ymd = params->date_start;
+            struct tm t = { .tm_year = (int)(ymd / 10000) - 1900,
+                            .tm_mon  = (int)((ymd / 100) % 100) - 1,
+                            .tm_mday = (int)(ymd % 100),
+                            .tm_hour = 12, .tm_isdst = -1 };
+            uint32_t end_ymd = params->date_end;
+            struct tm end_tm = { .tm_year = (int)(end_ymd / 10000) - 1900,
+                                 .tm_mon  = (int)((end_ymd / 100) % 100) - 1,
+                                 .tm_mday = (int)(end_ymd % 100),
+                                 .tm_hour = 12, .tm_isdst = -1 };
+            time_t end_epoch = mktime(&end_tm);
+            time_t cur = mktime(&t);
+            while (cur <= end_epoch) {
+                struct tm *lt = localtime(&cur);
+                if (params->days & (1 << lt->tm_wday)) { any_match = true; break; }
+                cur += 86400;
+            }
+            if (!any_match) return NULL;
+        }
+
+        /* Overlap check (pre-lock read is safe — slots only grow monotonically) */
+        if (circulate_overlaps(params, -1)) return NULL;
+    }
 
     routine_handle_t h = NULL;
     LOCK_GUARD(g_routines_mutex) {
@@ -262,12 +481,11 @@ routine_handle_t routine_create(uint8_t type, const routine_entry_t *params) {
             s_slots[i] = *params;
             s_slots[i].type = type;
             s_slots[i].in_use = true;
-            routines_nvs_save();
             h = &s_slots[i];
             break;
         }
     }
-    if (h) {
+    if (h) { routines_nvs_save();
         notify_bump_state();
         refresh_active_mask();
         routines_wake();
@@ -284,8 +502,8 @@ esp_err_t routine_remove(routine_handle_t h) {
         memset(&s_slots[i], 0, sizeof(s_slots[i]));
         s_last_toggle_epoch[i] = 0;
         s_circ_phase[i] = false;
-        routines_nvs_save();
     }
+    routines_nvs_save();
     notify_bump_state();
     refresh_active_mask();
     routines_wake();
@@ -328,13 +546,13 @@ void routines_init(void) {
     /* Validate loaded entries — clear any ghost slot where in_use is true
      * but type is not a recognized routine type. This recovers from NVS
      * corruption caused by the earlier deadlock bug. */
-    bool cleaned = false;
+    int cleaned = 0;
     for (int i = 0; i < ROUTINES_MAX; i++) {
         if (s_slots[i].in_use &&
             s_slots[i].type != RT_SCHEDULE &&
             s_slots[i].type != RT_CIRCULATE) {
             memset(&s_slots[i], 0, sizeof(s_slots[i]));
-            cleaned = true;
+            cleaned += 1;
         }
     }
     if (cleaned) {

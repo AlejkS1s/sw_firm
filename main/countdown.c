@@ -41,8 +41,14 @@ static void nvs_load(void) {
     if (!s_cd.active) { countdown_reset(); return; }
     time_t now = time(NULL);
     if (!timing_is_time_valid() || s_cd.target_epoch <= (uint32_t)now) {
+        ESP_LOGW(TAG, "stale countdown dropped (target=%lu now=%lu)",
+                 (unsigned long)s_cd.target_epoch, (unsigned long)now);
         countdown_reset();
         nvs_store_erase(NVS_NS_COUNTDOWN, NVS_KEY_COUNTDOWN_STATE);
+    } else {
+        uint32_t rem = s_cd.target_epoch - (uint32_t)now;
+        ESP_LOGI(TAG, "restored: %lus remaining -> %s at %lu",
+                 (unsigned long)rem, RELAY_STR(s_cd.relay_on), (unsigned long)s_cd.target_epoch);
     }
 }
 
@@ -56,7 +62,7 @@ static void timer_cb(void *arg) {
     taskEXIT_CRITICAL();
 
     if (cd.active && cd.target_epoch > 0 && (uint32_t)now >= cd.target_epoch) {
-        relay_set_async(cd.relay_on);
+        relay_set(cd.relay_on);
         ESP_LOGI(TAG, "fired -> %s", RELAY_STR(cd.relay_on));
         taskENTER_CRITICAL();
         memset(&s_cd, 0, sizeof(s_cd));
@@ -65,7 +71,7 @@ static void timer_cb(void *arg) {
         notify_bump_state();
     }
 
-    relay_auto_off_process(now);
+    relay_auto_off_process();
 }
 
 void countdown_init(void) {
