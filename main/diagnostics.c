@@ -5,7 +5,6 @@
 
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "nvs_store.h"
 #include "diagnostics.h"
 #include "power.h"
@@ -15,12 +14,6 @@
 
 static uint32_t s_boot_count = 0;
 
-/* Names match esp_reset_reason_t exactly (esp_system.h) — verified against
- * ESP8266_RTOS_SDK's esp_system.h, which does carry esp_reset_reason() /
- * ESP_RST_* despite the ESP8266 predating ESP-IDF's esp_reset_reason API
- * on other targets. ESP_RST_EXT and ESP_RST_SDIO are enumerated but the
- * SDK's own docs note they aren't reachable on this chip; kept here only
- * so the switch is exhaustive and -Wswitch stays quiet. */
 const char *diagnostics_reset_reason_str(esp_reset_reason_t r) {
     switch (r) {
         case ESP_RST_POWERON:   return "poweron";
@@ -49,40 +42,29 @@ unsigned long diagnostics_boot_count(void) {
 }
 
 size_t diagnostics_build_json(char *buf, size_t buflen) {
-    esp_reset_reason_t rr = esp_reset_reason();
+    unsigned long uptime = (unsigned long)(esp_timer_get_time() / USEC_PER_SEC);
     esp_chip_info_t chip;
     esp_chip_info(&chip);
 
-    unsigned long uptime = (unsigned long)(esp_timer_get_time() / USEC_PER_SEC);
-
-    int rssi = -1;
-    wifi_ap_record_t ap;
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
-        rssi = ap.rssi;
-
     int n = snprintf(buf, buflen,
         "{"
-        "\"reset_reason\":\"%s\","
-        "\"boot_count\":%lu,"
-        "\"uptime\":%lu,"
-        "\"heap_free\":%lu,"
-        "\"heap_min_free\":%lu,"
-        "\"chip_cores\":%d,"
-        "\"chip_revision\":%d,"
-        "\"wifi_rssi\":%d,"
-        "\"time_synced\":%s,"
-        "\"power_save_disabled\":%s,"
-        "\"connected_clients\":%u,"
-        "\"fw_ver\":\"" FW_VER "\","
-        "\"fw_build\":\"" FW_BUILD "\""
+        "\"rreason\":\"%s\","
+        "\"boots\":%lu,"
+        "\"uptm\":%lu,"
+        "\"free\":%lu,"
+        "\"minfree\":%lu,"
+        "\"cores\":%d,"
+        "\"rev\":%d,"
+        "\"tsync\":%s,"
+        "\"pwsdis\":%s,"
+        "\"clients\":%u"
         "}",
-        diagnostics_reset_reason_str(rr),
+        diagnostics_reset_reason_str(esp_reset_reason()),
         (unsigned long)s_boot_count,
         uptime,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
         chip.cores, chip.revision,
-        rssi,
         timing_time_ok() ? "true" : "false",
         power_save_is_disabled() ? "true" : "false",
         sse_client_count());
