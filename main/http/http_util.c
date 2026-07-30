@@ -17,6 +17,7 @@ static const struct { const char *status; const char *name; } ERR_TABLE[] = {
 
 void set_cors(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Private-Network", "true");
 }
 
 esp_err_t send_error(httpd_req_t *req, api_err_t code, const char *msg) {

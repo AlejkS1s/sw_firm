@@ -2,6 +2,7 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "power.h"
 #include "http_handlers.h"
@@ -37,6 +38,7 @@ static const route_t s_routes[] = {
     {"/api/v1/config/timezone",   HTTP_PUT,    put_tz},
     {"/api/v1/config/power-save", HTTP_PUT,    put_power_save},
     {"/api/v1/config/auto-off",   HTTP_PUT,    put_auto_off},
+    {"/api/v1/config/sse",        HTTP_PUT,    put_sse},
     {"/api/v1/timer",             HTTP_POST,   post_timer},
     {"/api/v1/timer",             HTTP_DELETE, delete_timer},
     {"/api/v1/routines",          HTTP_GET,    get_routines},
@@ -50,11 +52,23 @@ static const route_t s_routes[] = {
  * up in the table and forwards to the real handler.
  * ══════════════════════════════════════════════════════════════════════════ */
 
+static const char *method_name(httpd_method_t m) {
+    switch (m) {
+    case HTTP_GET:     return "GET";
+    case HTTP_POST:    return "POST";
+    case HTTP_PUT:     return "PUT";
+    case HTTP_DELETE:  return "DELETE";
+    case HTTP_OPTIONS: return "OPTIONS";
+    default:           return "?";
+    }
+}
+
 static esp_err_t dispatch(httpd_req_t *req) {
     if (req->method == HTTP_OPTIONS) {
         set_cors(req);
         httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
         httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, If-None-Match");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Private-Network", "true");
         httpd_resp_send(req, NULL, 0);
         return ESP_OK;
     }
@@ -63,13 +77,33 @@ static esp_err_t dispatch(httpd_req_t *req) {
 
     const char *q = uri_query_start(req);
     size_t plen = q ? (size_t)(q - req->uri) : strlen(req->uri);
+
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    const char *matched = NULL;
+
     for (int i = 0; i < (int)ARRAY_LEN(s_routes); i++) {
         if (req->method == s_routes[i].method &&
             plen == strlen(s_routes[i].uri) &&
-            memcmp(req->uri, s_routes[i].uri, plen) == 0)
-            return s_routes[i].handler(req);
+            memcmp(req->uri, s_routes[i].uri, plen) == 0) {
+            matched = s_routes[i].uri;
+            ret = s_routes[i].handler(req);
+            break;
+        }
     }
-    return send_error(req, E_NOT_FOUND, "no such endpoint");
+
+    int64_t dt_us = esp_timer_get_time() - t0;
+    if (matched) {
+        ESP_LOGI(TAG, "%s %s -> %s (%lu us)",
+                 method_name(req->method), matched,
+                 esp_err_to_name(ret), (unsigned long)dt_us);
+    } else {
+        ESP_LOGW(TAG, "%s %s -> 404 (%lu us)",
+                 method_name(req->method), req->uri, (unsigned long)dt_us);
+        ret = send_error(req, E_NOT_FOUND, "no such endpoint");
+    }
+
+    return ret;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -84,7 +118,7 @@ esp_err_t http_server_start(void) {
     /* NOTE: verify against CONFIG_LWIP_MAX_SOCKETS in your sdkconfig — mDNS
      * and SNTP also draw from the same socket pool on ESP8266. Lower this
      * if httpd_start() logs socket-allocation failures. */
-    cfg.max_open_sockets = 5;
+    cfg.max_open_sockets = 7;
     cfg.recv_wait_timeout = 10;
     cfg.send_wait_timeout = 10;
     /* If every socket is a held-open SSE stream, an incoming REST command

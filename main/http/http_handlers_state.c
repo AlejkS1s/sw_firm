@@ -20,12 +20,14 @@
 
 #define TAG "http_state"
 
+#define DEVICE_ID_MIN_LEN 7   /* 6 hex chars + NUL */
+
 
 /* ── Device ID ─────────────────────────────────────────────────────────────
  * Derives a short alphanumeric device ID from the STA MAC. The ID is
  * stable across reboots and factory resets (MAC is immutable). Format:
  * last 3 bytes of MAC as uppercase hex, e.g. "A1B2C3".
- * The buffer must be at least 7 bytes (6 chars + NUL).
+ * The buffer must be at least DEVICE_ID_MIN_LEN (7) bytes.
  * ──────────────────────────────────────────────────────────────────────── */
 static void device_id(char *buf, size_t buflen) {
     uint8_t mac[6];
@@ -52,6 +54,7 @@ esp_err_t get_state(httpd_req_t *req) {
         if (client_hash == hash) {
             set_cors(req);
             httpd_resp_set_status(req, "304 Not Modified");
+            ESP_LOGD(TAG, "GET state -> 304 (etag=%08x)", (unsigned)hash);
             return httpd_resp_send(req, NULL, 0);
         }
     }
@@ -59,6 +62,7 @@ esp_err_t get_state(httpd_req_t *req) {
     char buf[JSON_BUF_SIZE];
     size_t n = state_build_json(buf, sizeof(buf));
     if (n == 0) return send_error(req, E_INTERNAL, "state serialization failed");
+    ESP_LOGD(TAG, "GET state -> 200 (etag=%08x, %u bytes)", (unsigned)hash, (unsigned)n);
     return send_json(req, buf);
 }
 
@@ -78,11 +82,13 @@ esp_err_t get_state(httpd_req_t *req) {
 
 esp_err_t get_state_stream(httpd_req_t *req) {
     if (!sse_register(req)) {
+        ESP_LOGW(TAG, "SSE registration rejected (all slots full)");
         httpd_resp_set_status(req, "503 Service Unavailable");
         set_cors(req);
         return httpd_resp_send(req, NULL, 0);
     }
 
+    ESP_LOGI(TAG, "SSE stream opened");
     httpd_resp_set_type(req, "text/event-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     set_cors(req);
@@ -121,7 +127,7 @@ esp_err_t get_system(httpd_req_t *req) {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
 
-    char dev_id[16];
+    char dev_id[DEVICE_ID_MIN_LEN];
     device_id(dev_id, sizeof(dev_id));
 
     char ssid_buf[36] = "";
@@ -140,13 +146,14 @@ esp_err_t get_system(httpd_req_t *req) {
     if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip) == ESP_OK)
         strncpy(ip_str, ip4addr_ntoa(&ip.ip), sizeof(ip_str) - 1);
 
-    unsigned long heap     = (unsigned long)esp_get_free_heap_size();
-    unsigned long min_heap = (unsigned long)esp_get_minimum_free_heap_size();
-
-    esp_reset_reason_t rr = esp_reset_reason();
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
-    unsigned long uptime = (unsigned long)(esp_timer_get_time() / USEC_PER_SEC);
+    /* Build system-specific identity fields first, then splice the
+     * diagnostics JSON (rreason, boots, uptm, heap, cores, tsync, etc.)
+     * into the same response via diagnostics_build_json(). Both use the
+     * same field names ("rreason", "boots", ...), so no renaming needed. */
+    char diag[JSON_BUF_SIZE];
+    size_t diag_len = diagnostics_build_json(diag, sizeof(diag));
+    if (diag_len == 0)
+        return send_error(req, E_INTERNAL, "diagnostics failed");
 
     char buf[JSON_BUF_SIZE];
     int n = snprintf(buf, sizeof(buf),
@@ -157,33 +164,17 @@ esp_err_t get_system(httpd_req_t *req) {
         "\"rssi\":%d,"
         "\"ch\":%d,"
         "\"ip\":\"%s\","
-        "\"rev\":%d,"
         "\"fwver\":\"" FW_VER "\","
         "\"fwbld\":\"" FW_BUILD "\","
-        "\"cores\":%d,"
         "\"tz\":\"%s\","
-        "\"rreason\":\"%s\","
-        "\"boots\":%lu,"
-        "\"uptm\":%lu,"
-        "\"free\":%lu,"
-        "\"minfree\":%lu,"
-        "\"tsync\":%s,"
-        "\"pwsdis\":%s,"
-        "\"clients\":%u"
+        "%.*s"
         "}",
         dev_id, MAC2STR(mac), ssid_buf, rssi, channel, ip_str,
-        chip.revision, chip.cores,
         timing_get_timezone(),
-        diagnostics_reset_reason_str(rr),
-        (unsigned long)diagnostics_boot_count(),
-        uptime,
-        heap, min_heap,
-        timing_time_ok() ? "true" : "false",
-        power_save_is_disabled() ? "true" : "false",
-        sse_client_count());
+        (int)(diag_len - 2), diag + 1);  /* strip outer { } */
 
     if (n < 0 || (size_t)n >= sizeof(buf))
-        return send_error(req, E_INTERNAL, "cache serialization failed");
+        return send_error(req, E_INTERNAL, "system serialization failed");
     return send_json(req, buf);
 }
 
@@ -201,6 +192,7 @@ static esp_timer_handle_t s_reset_timer;
 
 static void reset_timer_cb(void *arg) {
     (void)arg;
+    s_reset_scheduled = false;
     esp_restart();
 }
 
@@ -233,6 +225,7 @@ esp_err_t post_system_factory_reset(httpd_req_t *req) {
     nvs_store_erase_all(NVS_NS_TIME);
     nvs_store_erase_all(NVS_NS_DIAG);
     nvs_store_erase_all(NVS_NS_POWER);
+    nvs_store_erase_all(NVS_NS_SSE);
     if (!s_reset_scheduled) {
         s_reset_scheduled = true;
         esp_err_t e = timer_create_and_start(&reset_timer_cb, "sys_fct_rs",

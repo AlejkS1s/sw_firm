@@ -65,11 +65,14 @@ esp_err_t send_json(httpd_req_t *req, const char *json);
 
 /* Conflict guard for operations that must not run while auto-off is armed.
  * Used by timer-post and routines-post in http_handlers_control.c and
- * http_handlers_routines.c.  Returns E_CONFLICT if auto-off is armed,
- * ESP_OK otherwise — callers can `return check_auto_off_conflict(req);`. */
+ * http_handlers_routines.c.  Sends the error response if armed, always
+ * returns ESP_FAIL on conflict so the caller's `if (conflict != ESP_OK)`
+ * catches it regardless of what send_error returns. */
 static inline esp_err_t check_auto_off_conflict(httpd_req_t *req) {
-    if (relay_auto_off_is_armed())
-        return send_error(req, E_CONFLICT, "auto-off is armed; clear it before this operation");
+    if (relay_auto_off_is_armed()) {
+        send_error(req, E_CONFLICT, "auto-off is armed; clear it before this operation");
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 

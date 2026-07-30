@@ -1,14 +1,19 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 
 #include "board.h"
 #include "countdown.h"
 #include "power.h"
+#include "sse.h"
 #include "timing.h"
 
 #include "http_handlers.h"
 #include "http_util.h"
+
+#define TAG "http_ctrl"
 
 
 
@@ -17,19 +22,25 @@
  * ══════════════════════════════════════════════════════════════════════════ */
 
 esp_err_t post_relay(httpd_req_t *req) {
+    int64_t t0 = esp_timer_get_time();
     cJSON *root = parse_json_body(req);
     if (!root) return send_error(req, E_BAD_JSON, ERR_BAD_JSON);
 
     const char *action = json_get_string(root, "action", "");
     esp_err_t e = ESP_FAIL;
-    if (strcmp(action, "on") == 0)          e = relay_set_sync(true);
-    else if (strcmp(action, "off") == 0)    e = relay_set_sync(false);
-    else if (strcmp(action, "toggle") == 0) e = relay_toggle_sync();
+    if (strcmp(action, "on") == 0)          { relay_set(true); e = ESP_OK; }
+    else if (strcmp(action, "off") == 0)    { relay_set(false); e = ESP_OK; }
+    else if (strcmp(action, "toggle") == 0) { relay_toggle(); e = ESP_OK; }
     else { cJSON_Delete(root); return send_error(req, E_INVALID_ARG, "action must be one of on|off|toggle"); }
     cJSON_Delete(root);
 
-    if (e != ESP_OK) return send_error(req, E_INTERNAL, "relay command failed");
+    int64_t dt_us = esp_timer_get_time() - t0;
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "relay %s FAILED (%s, %lu us)", action, esp_err_to_name(e), (unsigned long)dt_us);
+        return send_error(req, E_INTERNAL, "relay command failed");
+    }
 
+    ESP_LOGI(TAG, "relay %s -> %s (%lu us)", action, BOOL_STR(relay_get()), (unsigned long)dt_us);
     char buf[RESP_BUF_SIZE];
     snprintf(buf, sizeof(buf), "{\"relay\":%s}", BOOL_STR(relay_get()));
     return send_json(req, buf);
@@ -47,6 +58,7 @@ esp_err_t put_boot(httpd_req_t *req) {
     if (mode < 0 || mode > RELAY_BOOT_AUTO)
         return send_error(req, E_INVALID_ARG, "mode out of range");
     relay_set_boot_behavior((uint8_t)mode);
+    ESP_LOGI(TAG, "boot mode -> %d", mode);
     return send_ok(req);
 }
 
@@ -58,6 +70,7 @@ esp_err_t put_led(httpd_req_t *req) {
     if (mode < 0 || mode > LED_MODE_MAX)
         return send_error(req, E_INVALID_ARG, "mode out of range");
     led_set_mode((uint8_t)mode);
+    ESP_LOGI(TAG, "led mode -> 0x%02x", mode);
     return send_ok(req);
 }
 
@@ -69,6 +82,7 @@ esp_err_t put_tz(httpd_req_t *req) {
     cJSON_Delete(root);
 
     if (e != ESP_OK) return send_error(req, E_INVALID_ARG, "invalid timezone string");
+    ESP_LOGI(TAG, "timezone -> %s", tz);
     return send_ok(req);
 }
 
@@ -85,6 +99,7 @@ esp_err_t put_power_save(httpd_req_t *req) {
 
     if (!has_field) return send_error(req, E_INVALID_ARG, "disabled (bool) is required");
     power_set_save_disabled(disabled);
+    ESP_LOGI(TAG, "power-save -> %s", disabled ? "disabled" : "enabled");
     return send_ok(req);
 }
 
@@ -105,6 +120,7 @@ esp_err_t put_auto_off(httpd_req_t *req) {
 
     if (!enabled) {
         relay_auto_off_clear();
+        ESP_LOGI(TAG, "auto-off cleared");
         return send_ok(req);
     }
 
@@ -113,6 +129,7 @@ esp_err_t put_auto_off(httpd_req_t *req) {
         return send_error(req, E_INVALID_ARG, "duration must be between 1 second and 24 hours");
     if (!relay_set_auto_off(h, m, s))
         return send_error(req, E_CONFLICT, "a timer or routine is currently active");
+    ESP_LOGI(TAG, "auto-off set %02d:%02d:%02d", h, m, s);
     return send_ok(req);
 }
 
@@ -134,10 +151,33 @@ esp_err_t post_timer(httpd_req_t *req) {
     if (conflict != ESP_OK) return conflict;
 
     countdown_set(dur, relay_on);
+    ESP_LOGI(TAG, "timer set %lus -> %s", (unsigned long)dur, RELAY_STR(relay_on));
     return send_ok(req);
 }
 
 esp_err_t delete_timer(httpd_req_t *req) {
     countdown_cancel();
+    ESP_LOGI(TAG, "timer cancelled");
+    return send_ok(req);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * PUT /api/v1/config/sse  { "enabled": true | false }
+ *
+ * Toggles the entire SSE subsystem. When disabled, all existing SSE
+ * connections are closed immediately and new registrations are rejected
+ * with 503. The setting is persisted to NVS and survives reboots.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+esp_err_t put_sse(httpd_req_t *req) {
+    cJSON *root = parse_json_body(req);
+    if (!root) return send_error(req, E_BAD_JSON, ERR_BAD_JSON);
+    bool enabled = json_get_bool(root, "enabled", true);
+    bool has_field = cJSON_GetObjectItem(root, "enabled") != NULL;
+    cJSON_Delete(root);
+
+    if (!has_field) return send_error(req, E_INVALID_ARG, "enabled (bool) is required");
+    sse_set_enabled(enabled);
+    ESP_LOGI(TAG, "sse -> %s", enabled ? "enabled" : "disabled");
     return send_ok(req);
 }

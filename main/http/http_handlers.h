@@ -22,6 +22,7 @@ esp_err_t put_led(httpd_req_t *req);            /* PUT    /api/v1/config/led    
 esp_err_t put_tz(httpd_req_t *req);             /* PUT    /api/v1/config/timezone*/
 esp_err_t put_power_save(httpd_req_t *req);     /* PUT    /api/v1/config/power-save */
 esp_err_t put_auto_off(httpd_req_t *req);       /* PUT    /api/v1/config/auto-off */
+esp_err_t put_sse(httpd_req_t *req);            /* PUT    /api/v1/config/sse     */
 esp_err_t post_timer(httpd_req_t *req);         /* POST   /api/v1/timer          */
 esp_err_t delete_timer(httpd_req_t *req);       /* DELETE /api/v1/timer          */
 
