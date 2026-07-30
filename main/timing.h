@@ -12,7 +12,7 @@
 #define MIN_PER_HOUR         60
 #define HMS_TO_SEC(h,m,s)    ((uint64_t)(h) * 3600ULL + (uint64_t)(m) * 60ULL + (uint64_t)(s))
 
-/* Max timezone string length (POSIX format, e.g. "COT5"). Shared by ipc.h,
+/* Max timezone string length (POSIX format, e.g. "COT5"). Shared by nvs_store.h,
  * state.c, and timing.c — defined here once. */
 #define TZ_MAX_LEN 32
 

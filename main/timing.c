@@ -170,7 +170,12 @@ void timing_ntp_health_start(void) {
 void timing_ntp_sync_cb(struct timeval *tv) {
     ESP_LOGI(TAG, "NTP sync callback: time=%ld", (long)tv->tv_sec);
     s_ntp_synced = true;
-    timing_save();
+    /* Do NOT call timing_save() here — this callback runs in the lwIP
+     * SNTP task (tcpip thread).  nvs_commit() does a flash erase+write
+     * that disables the SPI cache and blocks ALL TCP/IP processing
+     * (ARP, TCP, UDP) for tens of ms, making the device unreachable.
+     * Instead, the routines task (woken by routines_wake() below) will
+     * call timing_save() from its own safe context. */
     timing_on_ntp_synced();
 }
 
