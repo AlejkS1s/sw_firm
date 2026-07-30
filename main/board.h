@@ -5,8 +5,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#include "esp_err.h"
-
 /* ── LED Overrides ── */
 typedef enum {
     LED_OFF = 0,
@@ -75,25 +73,10 @@ typedef enum {
 
 void board_init(void);
 
-/* ── Relay command API ─────────────────────────────────────────────────────
- * Three tiers, all callers pick the right one:
- *
- *   relay_set_sync / relay_toggle_sync  — block until the actuatator task
- *     has applied the change.  Only HTTP handlers need this (they must send
- *     the response after the relay actually toggles).
- *
- *   relay_set_async(on) / relay_toggle_async  — fire-and-forget, never
- *     blocks.  Safe from any context (task, timer callback).
- *
- *   relay_set_async_retry(on) — alias for relay_set_async.  Kept as a
- *     separate symbol for auto-off call sites where a dropped message
- *     is permanent (the queue depth increase from 8 to 16 makes loss
- *     effectively impossible under normal operation). */
-esp_err_t relay_set_sync(bool on);
-esp_err_t relay_toggle_sync(void);
-void     relay_set_async(bool on);
-void     relay_set_async_retry(bool on);
-void     relay_toggle_async(void);
+/* Set relay on/off or toggle. Mutex-guarded, persists to NVS, bumps state.
+ * Safe from any context (task, timer callback). */
+void relay_set(bool on);
+void relay_toggle(void);
 
 /* Returns the current relay state (mutex-guarded read). */
 bool relay_get(void);
@@ -109,11 +92,9 @@ bool      relay_set_auto_off(uint8_t h, uint8_t m, uint8_t s);
 void      relay_auto_off_clear(void);
 bool      relay_auto_off_is_armed(void);
 auto_off_t relay_get_auto_off(void);
-void      relay_auto_off_process(time_t now);
+void      relay_auto_off_process(void);
 
-/* Request an LED pattern. Routes a CMD_SET_LED_PATTERN to the actuator task
- * (does NOT apply directly — the actuator owns the LED). Safe to call from
- * any task/context. */
+/* Apply an LED override pattern immediately. Safe from any task/context. */
 void led_set_pattern(led_conf_t pat);
 
 void led_set_mode(uint8_t bitmask);

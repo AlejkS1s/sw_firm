@@ -1,12 +1,9 @@
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "countdown.h"
@@ -21,35 +18,6 @@
 
 #define TAG "board"
 
-/* ── Private actuator types & constants ────────────────────────────────────
- * actuaor_msg_t, command enum, and queue depth are internal to this module.
- * The only external relay API is relay_set_sync/async/toggle_async. */
-#define ACTUATOR_Q_DEPTH  16
-#define ACK_TIMEOUT_MS  1000
-#define ACTUATOR_STACK  3072
-#define ACTUATOR_PRIO    5
-
-typedef enum {
-    CMD_TURN_ON = 0,
-    CMD_TURN_OFF,
-    CMD_TOGGLE,
-    CMD_SET_LED_PATTERN,
-} actuator_cmd_type_t;
-
-#define RELAY_CMD(on)  ((on) ? CMD_TURN_ON : CMD_TURN_OFF)
-
-/* Synchronous callers use task notifications instead of a dynamically
- * allocated semaphore — avoids the use-after-free bug where a timeout
- * destroys the semaphore while the message is still in the queue. */
-typedef struct {
-    actuator_cmd_type_t type;
-    led_conf_t          led_pattern;
-    TaskHandle_t        notif_task;   /* NULL = fire-and-forget */
-    uint32_t            notif_value;  /* unique per-call ID */
-    esp_err_t           result;
-} actuator_msg_t;
-
-static QueueHandle_t   g_actuator_q   = NULL;
 SemaphoreHandle_t      g_relay_mutex  = NULL;
 
 /* ── Pin and timing constants ──────────────────────────────────────────── */
@@ -88,6 +56,7 @@ static int                s_blink_counter;
 static int                s_blink_on_ticks;
 static int                s_blink_off_ticks;
 static int                s_blink_phase;           /* remaining repeats (0 = infinite) */
+static led_conf_t         s_active_pattern = LED_OFF; /* current override pattern */
 
 /* Button (CONFIG_BUTTON_ENABLE) */
 #if defined(CONFIG_BUTTON_ENABLE)
@@ -98,6 +67,8 @@ static int64_t            s_btn_press_time = 0;
 static bool               s_btn_long_triggered = false;
 static esp_timer_handle_t s_btn_timer;
 #endif
+
+static esp_timer_handle_t s_housekeeping_timer;
 
 /* ══════════════════════════════════════════════════════════════════════════
  * LED Control — two modes: override (pattern from connection.c) and normal
@@ -127,9 +98,11 @@ static void led_blink_start(int period_us, int off_ratio, int repeats) {
 }
 
 /* Evaluate the user-mode bitmask against current state.
- * Called from the actuator task only — s_led_mode and s_relay_active are
- * private to this task.  Reads g_routine_active_mask (routines.c) for
- * routine-activity status without acquiring any mutex. */
+ * Called from the housekeeping timer only — s_led_mode and s_relay_active
+ * are read without locking (written under g_relay_mutex, read here in
+ * timer context which is benign as long as volatile isn't needed for
+ * correctness). Reads g_routine_active_mask (routines.c) for routine-
+ * activity status without acquiring any mutex. */
 static bool led_eval(void) {
     uint8_t mode = s_led_mode;
     if ((mode & LED_MODE_RELAY) && s_relay_active) return true;
@@ -143,18 +116,14 @@ static bool led_eval(void) {
 }
 
 /* Recompute LED state from the user bitmask. No-op while an override pattern
- * is active. Called from the actuator task only. */
+ * is active. Called from the housekeeping timer. */
 void led_update(void) {
     if (s_override) return;
     if (led_eval()) led_hw_on(); else led_hw_off();
 }
 
-/* Apply an override pattern (called from actuator task only). */
+/* Apply an override pattern. */
 static void led_apply(led_conf_t pat) {
-    /* Skip if the same continuous pattern is already running — re-applying
-     * it would reset the blink phase and cause a visible hiccup. LED_BLINK_OK
-     * is exempt: re-triggering it is an intentional fresh confirmation. */
-    static led_conf_t s_active_pattern = LED_OFF;
     if (pat == s_active_pattern && pat != LED_BLINK_OK) return;
     s_active_pattern = pat;
 
@@ -206,11 +175,9 @@ static void led_timer_cb(void *arg) {
     }
 }
 
-/* Request an override pattern from outside the actuator task.
- * Routes CMD_SET_LED_PATTERN to the actuator queue. */
+/* Apply an LED override pattern immediately. */
 void led_set_pattern(led_conf_t pat) {
-    actuator_msg_t m = { .type = CMD_SET_LED_PATTERN, .led_pattern = pat };
-    xQueueSend(g_actuator_q, &m, 0);
+    led_apply(pat);
 }
 
 bool led_get(void) {
@@ -255,8 +222,6 @@ static void nvs_save_boot_mode(void) {
     nvs_store_set_u8(NVS_NS_RELAY, NVS_KEY_RELAY_BOOT, s_boot_mode);
 }
 
-/* Set relay on/off (active-low: on = GPIO3 LOW). Mutex-guarded; persists to
- * NVS and bumps the state version. Called only by the actuator task. */
 void relay_set(bool on) {
     bool was;
     LOCK_GUARD(g_relay_mutex) {
@@ -272,7 +237,12 @@ void relay_set(bool on) {
 
     nvs_save_relay();
     notify_bump_state();
-    ESP_LOGI(TAG, "Relay set: %s (was=%s)", RELAY_STR(on), RELAY_STR(was));
+    power_notify_activity();
+    ESP_LOGI(TAG, "Relay: %s (was=%s)", RELAY_STR(on), RELAY_STR(was));
+}
+
+void relay_toggle(void) {
+    relay_set(!relay_get());
 }
 
 bool relay_get(void) {
@@ -298,11 +268,8 @@ uint8_t relay_get_boot_behavior(void) {
 static uint8_t s_auto_off_h = 0;
 static uint8_t s_auto_off_m = 0;
 static uint8_t s_auto_off_s = 0;
-static bool    s_auto_off_en = false;
+static bool    s_auto_off_enabled = false;
 
-static TaskHandle_t       g_actuator_task  = NULL;
-
-/* Persisted as a single packed blob (replaces 4 separate u8 keys). */
 typedef struct __attribute__((packed)) {
     uint8_t hour;
     uint8_t minute;
@@ -315,7 +282,7 @@ static void nvs_save_auto_off(void) {
         .hour    = s_auto_off_h,
         .minute  = s_auto_off_m,
         .second  = s_auto_off_s,
-        .enabled = s_auto_off_en ? 1 : 0,
+        .enabled = s_auto_off_enabled ? 1 : 0,
     };
     nvs_store_set_blob(NVS_NS_RELAY, NVS_KEY_AOFF, &p, sizeof(p));
 }
@@ -327,7 +294,7 @@ static void nvs_load_auto_off(void) {
         s_auto_off_h = p.hour;
         s_auto_off_m = p.minute;
         s_auto_off_s = p.second;
-        s_auto_off_en = (p.enabled != 0);
+        s_auto_off_enabled = (p.enabled != 0);
     }
 }
 
@@ -339,7 +306,7 @@ bool relay_set_auto_off(uint8_t h, uint8_t m, uint8_t s) {
     s_auto_off_h = h;
     s_auto_off_m = m;
     s_auto_off_s = s;
-    s_auto_off_en = true;
+    s_auto_off_enabled = true;
     s_auto_off_fired_in_cycle = false;
     nvs_save_auto_off();
     notify_bump_state();
@@ -351,7 +318,7 @@ void relay_auto_off_clear(void) {
     s_auto_off_h = 0;
     s_auto_off_m = 0;
     s_auto_off_s = 0;
-    s_auto_off_en = false;
+    s_auto_off_enabled = false;
     s_auto_off_fired_in_cycle = false;
     nvs_save_auto_off();
     notify_bump_state();
@@ -359,28 +326,41 @@ void relay_auto_off_clear(void) {
 }
 
 bool relay_auto_off_is_armed(void) {
-    return s_auto_off_en;
+    return s_auto_off_enabled;
 }
 
 auto_off_t relay_get_auto_off(void) {
     auto_off_t a = { .hour = s_auto_off_h, .minute = s_auto_off_m,
-                     .second = s_auto_off_s, .enabled = s_auto_off_en };
+                     .second = s_auto_off_s,          .enabled = s_auto_off_enabled };
     return a;
 }
 
-void relay_auto_off_process(time_t now) {
-    (void)now;
-    if (!s_auto_off_en) return;
+void relay_auto_off_process(void) {
+    if (!s_auto_off_enabled) return;
     if (!relay_get()) return;
     if (s_auto_off_fired_in_cycle) return;
     uint64_t delay_us = HMS_TO_SEC(s_auto_off_h, s_auto_off_m, s_auto_off_s) * USEC_PER_SEC;
     if (delay_us == 0) return;
     if (s_auto_off_relay_on_time == 0) return;
     if (esp_timer_get_time() - s_auto_off_relay_on_time < delay_us) return;
-    relay_set_async_retry(false);
+    relay_set(false);
     ESP_LOGI(TAG, "auto-off fired (delay %02d:%02d:%02d)", s_auto_off_h, s_auto_off_m, s_auto_off_s);
     s_auto_off_fired_in_cycle = true;
     notify_bump_state();
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Housekeeping timer — replaces the old actuator task loop. Runs every
+ * 500ms to update the LED (user bitmask) and evaluate power-management
+ * idle timeout.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#define HOUSEKEEPING_PERIOD_US  500000
+
+static void housekeeping_timer_cb(void *arg) {
+    (void)arg;
+    led_update();
+    power_process();
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -393,7 +373,7 @@ static void handle_button_event(btn_event_t evt) {
     switch (evt) {
     case BTN_SHORT_PRESS:
         ESP_LOGI(TAG, "Short press -> toggle relay");
-        relay_toggle_async();
+        relay_toggle();
         break;
     case BTN_LONG_PRESS:
         ESP_LOGI(TAG, "Long press -> WiFi reconnect");
@@ -404,7 +384,7 @@ static void handle_button_event(btn_event_t evt) {
     }
 }
 
-/* Periodic debounce sampler. Runs in an esp_timer task (not ISR), so posting
+/* Periodic debounce sampler. Runs in an esp_timer task (not ISR), so
  * calling wifi_reconnect() is safe. */
 static void btn_timer_cb(void *arg) {
     int level = gpio_get_level(PIN_BUTTON);
@@ -475,100 +455,10 @@ static void btn_timer_cb(void *arg) {
 #endif /* CONFIG_BUTTON_ENABLE */
 
 /* ══════════════════════════════════════════════════════════════════════════
- * Synchronous actuator wrappers — used by HTTP handlers
- * ══════════════════════════════════════════════════════════════════════════ */
-
-/* Synchronous send: uses task notification instead of a semaphore.
- * Clears any stale notification from a previous timed-out call first,
- * then waits for the actuator task to send back the matching value.
- * The static counter per-task is safe: each httpd worker calls this
- * one request at a time, so there is no concurrency within a task. */
-static esp_err_t actuator_send_sync(actuator_msg_t *m) {
-    static uint32_t s_sync_seq = 0;
-    uint32_t val;
-
-    /* Drain any stale notification left by a prior timeout. */
-    xTaskNotifyWait(0xFFFFFFFF, 0xFFFFFFFF, &val, 0);
-
-    m->notif_task  = xTaskGetCurrentTaskHandle();
-    m->notif_value = ++s_sync_seq;
-
-    if (xQueueSend(g_actuator_q, m, pdMS_TO_TICKS(ACK_TIMEOUT_MS)) != pdTRUE)
-        return ESP_FAIL;
-
-    if (xTaskNotifyWait(0xFFFFFFFF, 0xFFFFFFFF, &val,
-                        pdMS_TO_TICKS(ACK_TIMEOUT_MS)) != pdTRUE)
-        return ESP_FAIL;  /* timeout — notification may arrive later */
-
-    return (val == m->notif_value) ? m->result : ESP_FAIL;
-}
-
-esp_err_t relay_set_sync(bool on) {
-    actuator_msg_t m = { .type = RELAY_CMD(on) };
-    return actuator_send_sync(&m);
-}
-
-esp_err_t relay_toggle_sync(void) {
-    actuator_msg_t m = { .type = CMD_TOGGLE };
-    return actuator_send_sync(&m);
-}
-
-/* ══════════════════════════════════════════════════════════════════════════
- * Fire-and-forget relay wrappers — called from timers, buttons, routines
- * ══════════════════════════════════════════════════════════════════════════ */
-
-void relay_set_async(bool on) {
-    actuator_msg_t m = { .type = RELAY_CMD(on) };
-    xQueueSend(g_actuator_q, &m, 0);
-}
-
-void relay_toggle_async(void) {
-    actuator_msg_t m = { .type = CMD_TOGGLE };
-    xQueueSend(g_actuator_q, &m, 0);
-}
-
-void relay_set_async_retry(bool on) {
-    actuator_msg_t m = { .type = RELAY_CMD(on) };
-    xQueueSend(g_actuator_q, &m, 0);
-}
-
-/* ══════════════════════════════════════════════════════════════════════════
- * Actuator task — owns relay, LED, boot mode, tz, and the power FSM
- * ══════════════════════════════════════════════════════════════════════════ */
-
-static void actuator_apply(actuator_msg_t *m) {
-    switch (m->type) {
-    case CMD_TURN_ON:           relay_set(true);             break;
-    case CMD_TURN_OFF:          relay_set(false);            break;
-    case CMD_TOGGLE:            relay_set(!relay_get());     break;
-    case CMD_SET_LED_PATTERN:   led_apply(m->led_pattern);   break;
-    default: break;
-    }
-}
-
-void actuator_task(void *arg) {
-    actuator_msg_t m;
-    const TickType_t q_wait = pdMS_TO_TICKS(ACK_TIMEOUT_MS);
-
-    for (;;) {
-        esp_task_wdt_reset();
-        if (xQueueReceive(g_actuator_q, &m, q_wait)) {
-            power_notify_activity();
-            actuator_apply(&m);
-            if (m.notif_task)
-                xTaskNotify(m.notif_task, m.notif_value, eSetValueWithOverwrite);
-        }
-        led_update();
-        power_process();
-    }
-}
-
-/* ══════════════════════════════════════════════════════════════════════════
  * Init
  * ══════════════════════════════════════════════════════════════════════════ */
 
 void board_init(void) {
-    g_actuator_q  = xQueueCreate(ACTUATOR_Q_DEPTH, sizeof(actuator_msg_t));
     g_relay_mutex = xSemaphoreCreateMutex();
 
     gpio_set_level(PIN_RELAY, 1);
@@ -601,6 +491,9 @@ void board_init(void) {
              PIN_BUTTON, (int)(BTN_POLL_INTERVAL_US / USEC_PER_MSEC));
 #endif
 
+    ESP_ERROR_CHECK(timer_create_and_start(&housekeeping_timer_cb, "housekeeping",
+                                           &s_housekeeping_timer, HOUSEKEEPING_PERIOD_US, true));
+
     nvs_load_led();
     nvs_load_boot_mode();
     nvs_load_auto_off();
@@ -616,7 +509,7 @@ void board_init(void) {
 
     if (restore) {
         gpio_set_level(PIN_RELAY, s_relay_active ? 0 : 1);
-        if (s_auto_off_en && s_relay_active)
+        if (s_auto_off_enabled && s_relay_active)
             s_auto_off_relay_on_time = esp_timer_get_time();
         ESP_LOGI(TAG, "relay recovery %s (mode %d)", RELAY_STR(s_relay_active), s_boot_mode);
     } else {
@@ -624,10 +517,6 @@ void board_init(void) {
         ESP_LOGI(TAG, "relay recovery OFF (mode %d)", s_boot_mode);
     }
 
-    ESP_LOGI(TAG, "LED mode 0x%02x", s_led_mode);
-
-    /* Spawn the actuator task once all board state is loaded. The queue
-     * (g_actuator_q) was created at the top of board_init(). */
-    xTaskCreate(actuator_task, "actuator", ACTUATOR_STACK, NULL,
-                ACTUATOR_PRIO, &g_actuator_task);
+    ESP_LOGI(TAG, "LED mode 0x%02x, housekeeping timer started (period=%dms)",
+             s_led_mode, (int)(HOUSEKEEPING_PERIOD_US / USEC_PER_MSEC));
 }
