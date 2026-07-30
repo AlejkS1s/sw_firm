@@ -29,7 +29,6 @@
 #include "esp_wifi.h"
 #include "mdns.h"
 #include "tcpip_adapter.h"
-#include "lwip/def.h"
 #include "nvs_store.h"
 #include "connection.h"
 #include "board.h"
@@ -87,6 +86,13 @@ static bool          s_mdns_done      = false;
  * Credential Helpers
  * ══════════════════════════════════════════════════════════════════════════ */
 
+/* Securely zero memory — volatile barrier prevents compiler from optimizing
+ * away the memset when the buffer is about to go out of scope. */
+static void secure_memzero(void *buf, size_t n) {
+    volatile unsigned char *p = (volatile unsigned char *)buf;
+    while (n--) *p++ = 0;
+}
+
 static void xor_mac(uint8_t *d, size_t n) {
     uint8_t mac[6];
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return;
@@ -118,8 +124,8 @@ static esp_err_t creds_save(const uint8_t *ssid, const uint8_t *pass) {
     xor_mac(pb, sizeof(pb));
     esp_err_t e = nvs_store_set_blob(NVS_NS_WIFI_CREDS, NVS_KEY_WIFI_SSID, sb, sizeof(sb));
     if (e == ESP_OK) e = nvs_store_set_blob(NVS_NS_WIFI_CREDS, NVS_KEY_WIFI_PASSWORD, pb, sizeof(pb));
-    memset(sb, 0, sizeof(sb));
-    memset(pb, 0, sizeof(pb));
+    secure_memzero(sb, sizeof(sb));
+    secure_memzero(pb, sizeof(pb));
     return e;
 }
 
@@ -160,7 +166,7 @@ static void sc_restart(void) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 static uint32_t backoff_delay_ms(void) {
-    int shift = LWIP_MIN(s_retry, WIFI_BACKOFF_MAX_SHIFT);
+    int shift = s_retry < WIFI_BACKOFF_MAX_SHIFT ? s_retry : WIFI_BACKOFF_MAX_SHIFT;
     return shift < 1 ? BACKOFF_BASE_MS : BACKOFF_BASE_MS << (shift - 1);
 }
 
@@ -229,7 +235,11 @@ static void on_sta_start(void) {
 }
 
 static void on_sta_connected(void) {
+    esp_timer_stop(s_sc_timer);
     tcpip_adapter_up(TCPIP_ADAPTER_IF_STA);
+    /* REQUIRED after tcpip_adapter_up(): without explicit dhcpc_start DHCP
+     * takes 140s; with it, ~9s. The 7 "handler already registered" warnings
+     * from esp_wifi_init() re-registering default handlers are cosmetic. */
     tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
     ESP_LOGI(TAG, "STA_CONNECTED: association OK, DHCP started");
 }
