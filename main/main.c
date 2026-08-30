@@ -15,6 +15,7 @@
 #include "power.h"
 #include "routines.h"
 #include "sse.h"
+#include "clients.h"
 #include "state.h"
 #include "timing.h"
 #include "connection.h"
@@ -64,12 +65,13 @@ void app_main(void) {
 
     /* ── Phase 2: Hardware + local state restoration ──────────────── */
     int64_t t2 = esp_timer_get_time();
-    board_init();       /* GPIO, NVS restore, relay mutex, housekeeping timer */
+    board_init();       /* GPIO, NVS restore, relay mutex; housekeeping on control task */
     timing_init();      /* timezone, NVS epoch seed */
-    countdown_init();   /* countdown state + 1s tick timer */
+    countdown_init();   /* countdown state restore (tick on control task) */
     routines_init();    /* routine table load; spawns routines_task */
     power_init();       /* idle timeout from Kconfig */
     sse_init();
+    clients_init();
     ESP_LOGI(TAG, "phase2 hw+state: %lu us", (unsigned long)(esp_timer_get_time() - t2));
 
     /* ── Phase 3: System services ──────────────────────────────────── */

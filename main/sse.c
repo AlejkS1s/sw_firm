@@ -56,8 +56,6 @@ static void sse_deactivate_slot(int i) {
     }
 }
 
-unsigned sse_client_count(void) { return s_unique_fds; }
-
 static uint32_t now_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
@@ -119,10 +117,9 @@ void sse_heartbeat_tick(void) {
     int last_fd = -1;
     for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
         if (!s_clients[i].active) continue;
+        client_seen(s_clients[i].client_id);   /* keep registry fresh for SSE-only clients */
         if (now - s_clients[i].last_activity_ms > SSE_STALE_MS) {
-            ESP_LOGW(TAG, "evicting stale slot=%d fd=%d (no activity for %lu s)",
-                     i, s_clients[i].fd,
-                     (unsigned long)((now - s_clients[i].last_activity_ms) / 1000));
+            ESP_LOGW(TAG, "evicting stale slot=%d fd=%d", i, s_clients[i].fd);
             sse_deactivate_slot(i);
             continue;
         }

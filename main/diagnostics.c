@@ -9,6 +9,7 @@
 #include "diagnostics.h"
 #include "power.h"
 #include "sse.h"
+#include "clients.h"
 #include "state.h"
 #include "timing.h"
 
@@ -67,7 +68,7 @@ size_t diagnostics_build_json(char *buf, size_t buflen) {
         chip.cores, chip.revision,
         timing_time_ok() ? "true" : "false",
         power_save_is_disabled() ? "true" : "false",
-        sse_client_count());
+        client_count_active());
 
     return snprintf_guard(n, buflen);
 }

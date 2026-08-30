@@ -79,6 +79,12 @@ static esp_err_t dispatch(httpd_req_t *req) {
 
     power_notify_activity();
 
+    /* Record the client by ID so /system reports a correct connection count
+     * even for REST-only clients (not just open SSE sockets). */
+    char _cid[CLIENT_ID_MAX_LEN];
+    client_extract_id(req, _cid, sizeof(_cid));
+    if (_cid[0]) client_seen(_cid);
+
     const char *q = uri_query_start(req);
     size_t plen = q ? (size_t)(q - req->uri) : strlen(req->uri);
 
