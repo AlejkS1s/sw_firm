@@ -7,7 +7,10 @@
 void sse_init(void);
 bool sse_register(httpd_req_t *req);
 void sse_notify(void);
-unsigned sse_client_count(void);
+
+/* Control-task tick (500 ms cadence): heartbeat push + stale-client eviction.
+ * Runs at high priority, hence the short SSE send timeout. */
+void sse_heartbeat_tick(void);
 
 /* SSE feature control — enable/disable the entire SSE subsystem.
  * When disabled, existing connections are closed immediately and new

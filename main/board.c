@@ -48,11 +48,14 @@ static uint8_t            s_boot_mode    = RELAY_BOOT_AUTO;
 static bool               s_auto_off_fired_in_cycle = false;
 static uint64_t           s_auto_off_relay_on_time = 0;
 
+static volatile bool      s_relay_save_pending = false;
+/* Relay persistence latency budget: control task flush interval (see routines.c). */
+#define RELAY_SAVE_MAX_LATENCY_MS 500   /* matches CTRL_TICK_MS in routines.c */
+
 /* LED — user bitmask + override state */
 static uint8_t            s_led_mode  = LED_MODE_RELAY;
 static bool               s_override  = false;     /* pattern active, bitmask bypassed */
-static esp_timer_handle_t s_led_timer;
-static int                s_blink_counter;
+static esp_timer_handle_t s_led_timer;static int                s_blink_counter;
 static int                s_blink_on_ticks;
 static int                s_blink_off_ticks;
 static int                s_blink_phase;           /* remaining repeats (0 = infinite) */
@@ -67,8 +70,6 @@ static int64_t            s_btn_press_time = 0;
 static bool               s_btn_long_triggered = false;
 static esp_timer_handle_t s_btn_timer;
 #endif
-
-static esp_timer_handle_t s_housekeeping_timer;
 
 /* ══════════════════════════════════════════════════════════════════════════
  * LED Control — two modes: override (pattern from connection.c) and normal
@@ -98,11 +99,11 @@ static void led_blink_start(int period_us, int off_ratio, int repeats) {
 }
 
 /* Evaluate the user-mode bitmask against current state.
- * Called from the housekeeping timer only — s_led_mode and s_relay_active
- * are read without locking (written under g_relay_mutex, read here in
- * timer context which is benign as long as volatile isn't needed for
- * correctness). Reads g_routine_active_mask (routines.c) for routine-
- * activity status without acquiring any mutex. */
+ * Called from the control task tick (routines.c) — s_led_mode and
+ * s_relay_active are read without locking (written under g_relay_mutex,
+ * read here in task context which is benign as long as volatile isn't
+ * needed for correctness). Reads g_routine_active_mask (routines.c) for
+ * routine-activity status without acquiring any mutex. */
 static bool led_eval(void) {
     uint8_t mode = s_led_mode;
     if ((mode & LED_MODE_RELAY) && s_relay_active) return true;
@@ -116,7 +117,7 @@ static bool led_eval(void) {
 }
 
 /* Recompute LED state from the user bitmask. No-op while an override pattern
- * is active. Called from the housekeeping timer. */
+ * is active. Called from the control task tick. */
 void led_update(void) {
     if (s_override) return;
     if (led_eval()) led_hw_on(); else led_hw_off();
@@ -235,9 +236,16 @@ void relay_set(bool on) {
         s_auto_off_relay_on_time = esp_timer_get_time();
     }
 
-    nvs_save_relay();
+    /* RAM state is authoritative immediately; flash write is deferred to the
+     * control task (relay_persist_tick) so callers never stall on NVS. A power
+     * cut within RELAY_SAVE_MAX_LATENCY_MS may lose the last toggle. */
+    s_relay_save_pending = true;
     notify_bump_state();
     power_notify_activity();
+    /* Re-evaluate the LED immediately so it tracks the relay edge-for-edge;
+     * the control-task tick would otherwise lag it by up to CTRL_TICK_MS.
+     * No-op while a connection override pattern is active. */
+    led_update();
     ESP_LOGI(TAG, "Relay: %s (was=%s)", RELAY_STR(on), RELAY_STR(was));
 }
 
@@ -335,6 +343,12 @@ auto_off_t relay_get_auto_off(void) {
     return a;
 }
 
+void relay_persist_tick(void) {
+    if (!s_relay_save_pending) return;
+    s_relay_save_pending = false;
+    nvs_save_relay();
+}
+
 void relay_auto_off_process(void) {
     if (!s_auto_off_enabled) return;
     if (!relay_get()) return;
@@ -347,20 +361,6 @@ void relay_auto_off_process(void) {
     ESP_LOGI(TAG, "auto-off fired (delay %02d:%02d:%02d)", s_auto_off_h, s_auto_off_m, s_auto_off_s);
     s_auto_off_fired_in_cycle = true;
     notify_bump_state();
-}
-
-/* ══════════════════════════════════════════════════════════════════════════
- * Housekeeping timer — replaces the old actuator task loop. Runs every
- * 500ms to update the LED (user bitmask) and evaluate power-management
- * idle timeout.
- * ══════════════════════════════════════════════════════════════════════════ */
-
-#define HOUSEKEEPING_PERIOD_US  500000
-
-static void housekeeping_timer_cb(void *arg) {
-    (void)arg;
-    led_update();
-    power_process();
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -491,9 +491,6 @@ void board_init(void) {
              PIN_BUTTON, (int)(BTN_POLL_INTERVAL_US / USEC_PER_MSEC));
 #endif
 
-    ESP_ERROR_CHECK(timer_create_and_start(&housekeeping_timer_cb, "housekeeping",
-                                           &s_housekeeping_timer, HOUSEKEEPING_PERIOD_US, true));
-
     nvs_load_led();
     nvs_load_boot_mode();
     nvs_load_auto_off();
@@ -517,6 +514,6 @@ void board_init(void) {
         ESP_LOGI(TAG, "relay recovery OFF (mode %d)", s_boot_mode);
     }
 
-    ESP_LOGI(TAG, "LED mode 0x%02x, housekeeping timer started (period=%dms)",
-             s_led_mode, (int)(HOUSEKEEPING_PERIOD_US / USEC_PER_MSEC));
+    ESP_LOGI(TAG, "LED mode 0x%02x, housekeeping on control task",
+             s_led_mode);
 }

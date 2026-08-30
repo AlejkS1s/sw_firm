@@ -23,15 +23,14 @@ typedef struct {
 } countdown_persist_t;
 
 static countdown_persist_t s_cd;
-static esp_timer_handle_t  s_timer;
+static volatile bool s_save_pending = false;
+static volatile bool s_erase_pending = false;
 
 static void countdown_reset(void) {
     memset(&s_cd, 0, sizeof(s_cd));
 }
 
-static void nvs_save(void) {
-    nvs_store_set_blob(NVS_NS_COUNTDOWN, NVS_KEY_COUNTDOWN_STATE, &s_cd, sizeof(s_cd));
-}
+static void nvs_save(void) { s_save_pending = true; }
 
 static void nvs_load(void) {
     size_t sz = sizeof(s_cd);
@@ -52,7 +51,9 @@ static void nvs_load(void) {
     }
 }
 
-static void timer_cb(void *arg) {
+/* Control-task tick (500 ms cadence, see routines.c): fires an expired
+ * countdown, flushes deferred NVS writes, runs auto-off arbitration. */
+void countdown_tick(void) {
     time_t now = time(NULL);
     if (!timing_is_time_valid()) return;
 
@@ -67,8 +68,17 @@ static void timer_cb(void *arg) {
         taskENTER_CRITICAL();
         memset(&s_cd, 0, sizeof(s_cd));
         taskEXIT_CRITICAL();
-        nvs_store_erase(NVS_NS_COUNTDOWN, NVS_KEY_COUNTDOWN_STATE);
+        s_erase_pending = true;
         notify_bump_state();
+    }
+
+    if (s_erase_pending) {
+        s_erase_pending = false;
+        nvs_store_erase(NVS_NS_COUNTDOWN, NVS_KEY_COUNTDOWN_STATE);
+    }
+    if (s_save_pending) {
+        s_save_pending = false;
+        nvs_store_set_blob(NVS_NS_COUNTDOWN, NVS_KEY_COUNTDOWN_STATE, &s_cd, sizeof(s_cd));
     }
 
     relay_auto_off_process();
@@ -76,7 +86,6 @@ static void timer_cb(void *arg) {
 
 void countdown_init(void) {
     nvs_load();
-    ESP_ERROR_CHECK(timer_create_and_start(&timer_cb, "cnt", &s_timer, USEC_PER_SEC, true));
     ESP_LOGI(TAG, "init: active=%d", s_cd.active);
 }
 
@@ -99,7 +108,7 @@ void countdown_cancel(void) {
     taskENTER_CRITICAL();
     memset(&s_cd, 0, sizeof(s_cd));
     taskEXIT_CRITICAL();
-    nvs_store_erase(NVS_NS_COUNTDOWN, NVS_KEY_COUNTDOWN_STATE);
+    s_erase_pending = true;
     notify_bump_state();
     ESP_LOGI(TAG, "cancelled");
 }

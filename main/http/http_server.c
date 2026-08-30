@@ -7,10 +7,14 @@
 #include "power.h"
 #include "http_handlers.h"
 #include "http_util.h"
+#include "clients.h"
 
 #define TAG "http_routes"
 #define HTTP_PORT 80
 #define MAX_URI_HANDLERS 40
+/* Below the control task (routines_task, prio 5): GPIO/scheduling outrank
+ * HTTP under load. esp_timer daemon sits at 2. */
+#define HTTPD_TASK_PRIO 3
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -121,6 +125,7 @@ esp_err_t http_server_start(void) {
     cfg.max_open_sockets = 7;
     cfg.recv_wait_timeout = 10;
     cfg.send_wait_timeout = 10;
+    cfg.task_priority     = HTTPD_TASK_PRIO;
     /* If every socket is a held-open SSE stream, an incoming REST command
      * must still be able to get through — reclaim the oldest connection
      * rather than reject the new one. */

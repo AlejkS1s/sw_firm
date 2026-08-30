@@ -5,6 +5,9 @@
 #define MAX_DURATION_S  86400
 
 void     countdown_init(void);
+/* Control-task tick: expiry check, deferred NVS flush, auto-off processing.
+ * Replaces the former esp_timer callback. */
+void     countdown_tick(void);
 void     countdown_set(uint32_t duration_s, bool relay_on);
 void     countdown_cancel(void);
 bool     countdown_is_active(void);

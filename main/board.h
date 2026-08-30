@@ -73,8 +73,9 @@ typedef enum {
 
 void board_init(void);
 
-/* Set relay on/off or toggle. Mutex-guarded, persists to NVS, bumps state.
- * Safe from any context (task, timer callback). */
+/* Set relay on/off or toggle. Updates RAM state + GPIO instantly (brief mutex),
+ * marks state dirty, bumps version. NVS persistence is deferred to the control
+ * task via relay_persist_tick(). Safe from any context (task, timer callback). */
 void relay_set(bool on);
 void relay_toggle(void);
 
@@ -94,8 +95,16 @@ bool      relay_auto_off_is_armed(void);
 auto_off_t relay_get_auto_off(void);
 void      relay_auto_off_process(void);
 
+/* Flush a pending relay-state NVS write. Called from the control task tick;
+ * relay_set() only marks the flag so callers never block on flash. */
+void relay_persist_tick(void);
+
 /* Apply an LED override pattern immediately. Safe from any task/context. */
 void led_set_pattern(led_conf_t pat);
+
+/* Recompute LED state in normal mode (user bitmask). Driven by the control
+ * task tick; no-op while an override pattern is active. */
+void led_update(void);
 
 void led_set_mode(uint8_t bitmask);
 uint8_t led_get_mode(void);

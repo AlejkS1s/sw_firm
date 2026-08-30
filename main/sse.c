@@ -1,19 +1,24 @@
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sse.h"
+#include "clients.h"
 #include "power.h"
 #include "state.h"
 #include "nvs_store.h"
 #include "http_util.h"
+#include "timing.h"
 
 #define TAG "sse"
-#define SSE_SEND_TIMEOUT_S  2
-#define SSE_HEARTBEAT_US    5000000
-#define SSE_STALE_MS        15000
+/* Raw send() timeout for SSE frames. Short by design: the control task
+ * (priority 5) calls this — a slow/dead client must never pin it. */
+#define SSE_SEND_TIMEOUT_MS   300
+#define SSE_HEARTBEAT_DIVIDER 30   /* control-task ticks (500 ms) → 15 s heartbeat */
+#define SSE_STALE_MS        45000
 #define SSE_MAX_CLIENTS     2
 
 typedef struct {
@@ -32,13 +37,6 @@ static bool s_has_snapshot = false;
 static unsigned s_unique_fds = 0;
 
 static bool s_sse_enabled = true;
-
-static esp_timer_handle_t s_heartbeat_timer;
-static bool s_heartbeat_running = false;
-
-static void sse_heartbeat_cb(void *arg);
-static void sse_heartbeat_start(void);
-static void sse_heartbeat_stop(void);
 
 /* Helper: true if slot j is the only active slot referencing slot i's fd. */
 static bool sse_is_last_ref(int i) {
@@ -69,8 +67,6 @@ void sse_init(void) {
     uint8_t v = 1;
     if (nvs_store_get_u8(NVS_NS_SSE, NVS_KEY_SSE_ENABLED, &v) == ESP_OK)
         s_sse_enabled = (v != 0);
-    esp_timer_create_args_t args = { .callback = sse_heartbeat_cb, .name = "sse_hb" };
-    esp_timer_create(&args, &s_heartbeat_timer);
 }
 
 void sse_set_enabled(bool enabled) {
@@ -88,14 +84,18 @@ bool sse_is_enabled(void) { return s_sse_enabled; }
 void sse_close_all(void) {
     for (int i = 0; i < SSE_MAX_CLIENTS; i++)
         sse_deactivate_slot(i);
-    sse_heartbeat_stop();
 }
 
 /* ── Heartbeat ────────────────────────────────────────────────────────── */
 
-static void sse_heartbeat_cb(void *arg) {
-    (void)arg;
-    if (s_unique_fds == 0) { sse_heartbeat_stop(); return; }
+/* Control-task tick (500 ms cadence): every SSE_HEARTBEAT_DIVIDER ticks,
+ * evict stale clients and push a heartbeat frame to live connections. */
+void sse_heartbeat_tick(void) {
+    static int divider = 0;
+    if (++divider < SSE_HEARTBEAT_DIVIDER) return;
+    divider = 0;
+
+    if (s_unique_fds == 0 || !s_sse_enabled) return;
 
     uint32_t now = now_ms();
     time_t t = time(NULL);
@@ -108,9 +108,6 @@ static void sse_heartbeat_cb(void *arg) {
     if (datalen < 0 || (size_t)(datalen + 12 + 2) > sizeof(buf)) return;
     int hdrlen = snprintf(buf, 12, "%x\r\n", datalen);
     if (hdrlen < 0 || hdrlen >= 12) return;
-
-    /* Compact: move SSE event from reserve slot (buf+12) right after the
-     * hex-length header, then append the trailing chunk CRLF. */
     int gap = 12 - hdrlen;
     if (gap > 0)
         memmove(buf + hdrlen, buf + 12, (size_t)datalen);
@@ -140,22 +137,6 @@ static void sse_heartbeat_cb(void *arg) {
             sse_deactivate_slot(i);
         }
     }
-
-    if (s_unique_fds == 0)
-        sse_heartbeat_stop();
-}
-
-static void sse_heartbeat_start(void) {
-    if (s_heartbeat_running || !s_sse_enabled) return;
-    if (esp_timer_start_periodic(s_heartbeat_timer, SSE_HEARTBEAT_US) == ESP_OK) {
-        s_heartbeat_running = true;
-    }
-}
-
-static void sse_heartbeat_stop(void) {
-    if (!s_heartbeat_running) return;
-    esp_timer_stop(s_heartbeat_timer);
-    s_heartbeat_running = false;
 }
 
 /* ── Registration ─────────────────────────────────────────────────────── */
@@ -183,7 +164,7 @@ static bool get_query_param(const char *uri, const char *key, char *out, size_t 
 }
 
 static void set_send_timeout(int fd) {
-    struct timeval tv = { .tv_sec = SSE_SEND_TIMEOUT_S, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = 0, .tv_usec = SSE_SEND_TIMEOUT_MS * USEC_PER_MSEC };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
@@ -192,8 +173,9 @@ static void set_send_timeout(int fd) {
 static bool sse_activate_slot(int i, int fd, httpd_handle_t handle,
                                const char *client_id, uint32_t now) {
     bool is_new_fd = true;
-    int j = i ^ 1;
-    if (s_clients[j].active && s_clients[j].fd == fd)
+    if (s_clients[i].active && s_clients[i].fd == fd)
+        is_new_fd = false;
+    else if (s_clients[i ^ 1].active && s_clients[i ^ 1].fd == fd)
         is_new_fd = false;
 
     s_clients[i].fd        = fd;
@@ -208,7 +190,6 @@ static bool sse_activate_slot(int i, int fd, httpd_handle_t handle,
         s_unique_fds++;
         power_sse_client_connected();
     }
-    sse_heartbeat_start();
     return true;
 }
 
@@ -302,8 +283,6 @@ static void sse_push_work(void *arg) {
         }
     }
 
-    if (s_unique_fds == 0)
-        sse_heartbeat_stop();
     s_push_pending = false;
 }
 
