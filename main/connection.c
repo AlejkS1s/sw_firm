@@ -11,7 +11,15 @@
  *   SC_VERIFY:    MAX_WIFI_RETRY_VERIFY (1) attempts, then sc_restart().
  *   SAVED:        exponential backoff 1s/2s/4s/…/32s cap, indefinite.
  *   CONNECTED:    falls back to SAVED on disconnect.
- *   Auth failure: always clears creds and restarts SmartConfig.
+ *   Auth failure: reason 202 is often transient (the AP may still hold the
+ *                 stale association from before a quick reset and reject the
+ *                 first re-auth). It follows the normal retry path; only
+ *                 after MAX_AUTH_FAIL_WIPE consecutive 202s are the creds
+ *                 cleared and SmartConfig started.
+ *   SC_LISTEN:    if saved creds exist and nobody provisions within
+ *                 SC_RESCUE_TIMEOUT_US, the rescue timer falls back to the
+ *                 saved-credentials path — a transient failure can never
+ *                 strand the device in provisioning mode.
  */
 
 #include <string.h>
@@ -40,6 +48,16 @@
 
 #define MAX_WIFI_RETRY_VERIFY 1
 #define WIFI_BACKOFF_MAX_SHIFT 6
+
+/* Consecutive AUTH_FAIL (202) disconnects before the credentials are
+ * declared bad and SmartConfig starts. A single 202 right after a reset is
+ * usually the AP rejecting a re-auth while it still holds the stale
+ * association from the previous session — retrying succeeds. */
+#define MAX_AUTH_FAIL_WIPE 3
+/* If SmartConfig is listening and saved creds exist, fall back to them after
+ * this long with no provisioning app. Prevents a transient failure from
+ * stranding the device in SC_LISTEN until a human power-cycles it. */
+#define SC_RESCUE_TIMEOUT_US 60000000ULL
 
 #define WIFI_ASSOC_TIMEOUT_US 15000000ULL
 #define SC_ACK_GRACE_TIMEOUT_US 15000000ULL
@@ -75,8 +93,10 @@ static const char *STATE_NAMES[] = {
 
 static EventGroupHandle_t g_net_evt  = NULL;
 static esp_timer_handle_t s_sc_timer;
+static esp_timer_handle_t s_rescue_timer;   /* SC_LISTEN → saved-creds fallback */
 static wifi_cstate_t s_state          = CSTATE_SC_LISTEN;
 static int           s_retry          = 0;
+static int           s_auth_fail_count = 0;
 static bool          s_ack_sent       = false;
 static bool          s_retry_pending  = false;
 static bool          s_ntp_done       = false;
@@ -140,6 +160,7 @@ static void sc_state_reset(void) {
 }
 
 static void sc_start(void) {
+    ESP_LOGW(TAG, "SC start (prev state=%s)", STATE_NAMES[s_state]);
     sc_state_reset();
     s_state = CSTATE_SC_LISTEN;
     esp_timer_stop(s_sc_timer);
@@ -148,6 +169,13 @@ static void sc_start(void) {
     ESP_ERROR_CHECK(esp_smartconfig_set_type(CONFIG_ESP_SMARTCONFIG_TYPE));
     smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_smartconfig_start(&cfg));
+    /* Rescue: if valid creds are still in NVS, don't wait for the app
+     * forever — fall back to them after SC_RESCUE_TIMEOUT_US. When SC was
+     * entered because the creds are genuinely gone/wiped, creds_load fails
+     * and no rescue is armed (the app is then the only way forward). */
+    wifi_config_t probe;
+    if (creds_load(&probe) == ESP_OK)
+        ESP_ERROR_CHECK(esp_timer_start_once(s_rescue_timer, SC_RESCUE_TIMEOUT_US));
     ESP_LOGI(TAG, "SC started");
 }
 
@@ -159,6 +187,39 @@ static void sc_restart(void) {
     s_state = CSTATE_SC_LISTEN;
     esp_timer_stop(s_sc_timer);
     ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, SC_SETTLE_US));
+}
+
+/* Leave SmartConfig and reconnect using the NVS credentials. Invoked by the
+ * rescue timer when SC_LISTEN has seen no provisioning app for
+ * SC_RESCUE_TIMEOUT_US. No-op if the credentials are gone (nothing to
+ * fall back to — the app is then the only way forward). */
+static void saved_reconnect(void) {
+    wifi_config_t saved = {
+        .sta = {
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
+            .listen_interval = 0,
+            .pmf_cfg = { .capable = false, .required = false },
+            .rm_enabled = false,
+            .btm_enabled = false,
+        },
+    };
+    if (creds_load(&saved) != ESP_OK) return;
+
+    esp_smartconfig_stop();
+    esp_timer_stop(s_sc_timer);
+    s_state = CSTATE_SAVED;
+    s_retry = 0;
+    led_set_pattern(LED_BLINK_SLOW);
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &saved));
+    esp_wifi_connect();
+    ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, WIFI_ASSOC_TIMEOUT_US));
+    ESP_LOGI(TAG, "SC rescue: no provisioning, reconnecting saved creds");
+}
+
+/* Rescue timer: SmartConfig has been listening too long. */
+static void rescue_timer_cb(void *arg) {
+    if (s_state != CSTATE_SC_LISTEN) return;   /* creds arrived meanwhile */
+    saved_reconnect();
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -250,14 +311,26 @@ static void on_sta_disconnected(void *data) {
              d->reason, STATE_NAMES[s_state]);
     xEventGroupClearBits(g_net_evt, WIFI_CONNECTED_BIT);
 
+    /* AUTH_FAIL (202) is retried like any other failure: a single 202 right
+     * after a reset is usually the AP rejecting the re-auth while it still
+     * holds the stale association from the previous session. Only after
+     * MAX_AUTH_FAIL_WIPE consecutive auth failures are the credentials
+     * declared bad — wiped, then SmartConfig. */
+    if (d->reason == WIFI_REASON_AUTH_FAIL &&
+        ++s_auth_fail_count >= MAX_AUTH_FAIL_WIPE) {
+        ESP_LOGW(TAG, "auth failed %d consecutive times -> clearing creds, SmartConfig",
+                 s_auth_fail_count);
+        s_auth_fail_count = 0;
+        creds_clear();
+        sc_restart();
+        return;
+    }
+
     switch (s_state) {
     case CSTATE_SC_VERIFY:
         esp_timer_stop(s_sc_timer);
         s_retry_pending = false;
-        if (d->reason == WIFI_REASON_AUTH_FAIL) {
-            ESP_LOGW(TAG, "AUTH_FAIL -> sc_restart");
-            sc_restart();
-        } else if (s_retry < MAX_WIFI_RETRY_VERIFY) {
+        if (s_retry < MAX_WIFI_RETRY_VERIFY) {
             s_retry++;
             s_retry_pending = true;
             ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, SC_RETRY_US));
@@ -271,32 +344,27 @@ static void on_sta_disconnected(void *data) {
     case CSTATE_CONNECTED:
         esp_timer_stop(s_sc_timer);
         s_retry_pending = false;
-        if (d->reason == WIFI_REASON_AUTH_FAIL) {
-            ESP_LOGW(TAG, "AUTH_FAIL -> sc_restart (clearing creds)");
-            sc_restart();
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        {   wifi_config_t c;
+            if (esp_wifi_get_config(ESP_IF_WIFI_STA, &c) == ESP_OK) {
+                c.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+                c.sta.channel = 0;
+                c.sta.bssid_set = false;
+                c.sta.listen_interval = 0;
+                esp_wifi_set_config(ESP_IF_WIFI_STA, &c);
+            }
+        }
+        s_retry++;
+        s_state = CSTATE_SAVED;
+        led_set_pattern(LED_BLINK_SLOW);
+        if (s_retry <= WIFI_WARMUP_ATTEMPTS) {
+            esp_wifi_connect();
+            esp_timer_stop(s_sc_timer);
+            ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, WIFI_ASSOC_TIMEOUT_US));
         } else {
-            esp_wifi_set_ps(WIFI_PS_NONE);
-            {   wifi_config_t c;
-                if (esp_wifi_get_config(ESP_IF_WIFI_STA, &c) == ESP_OK) {
-                    c.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-                    c.sta.channel = 0;
-                    c.sta.bssid_set = false;
-                    c.sta.listen_interval = 0;
-                    esp_wifi_set_config(ESP_IF_WIFI_STA, &c);
-                }
-            }
-            s_retry++;
-            s_state = CSTATE_SAVED;
-            led_set_pattern(LED_BLINK_SLOW);
-            if (s_retry <= WIFI_WARMUP_ATTEMPTS) {
-                esp_wifi_connect();
-                esp_timer_stop(s_sc_timer);
-                ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, WIFI_ASSOC_TIMEOUT_US));
-            } else {
-                uint32_t delay_ms = backoff_delay_ms();
-                s_retry_pending = true;
-                ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, (uint64_t)delay_ms * USEC_PER_MSEC));
-            }
+            uint32_t delay_ms = backoff_delay_ms();
+            s_retry_pending = true;
+            ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, (uint64_t)delay_ms * USEC_PER_MSEC));
         }
         break;
 
@@ -317,8 +385,10 @@ static void on_got_ip(void *data) {
         ESP_LOGW(TAG, "STA MAC: failed to read");
 
     esp_timer_stop(s_sc_timer);
+    esp_timer_stop(s_rescue_timer);
     s_retry = 0;
     s_retry_pending = false;
+    s_auth_fail_count = 0;   /* online — auth-fail streak over */
 
     if (s_state == CSTATE_SC_VERIFY) {
         wifi_config_t cfg = {0};
@@ -390,6 +460,7 @@ static void on_sc_got_ssid_pwd(void *data) {
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_connect());
     esp_timer_stop(s_sc_timer);
+    esp_timer_stop(s_rescue_timer);   /* creds received — rescue no longer needed */
     ESP_ERROR_CHECK(esp_timer_start_once(s_sc_timer, SC_VERIFY_US));
 }
 
@@ -456,6 +527,12 @@ void wifi_init(void) {
     };
     ESP_ERROR_CHECK(esp_timer_create(&ta, &s_sc_timer));
 
+    esp_timer_create_args_t tra = {
+        .callback = &rescue_timer_cb,
+        .name = "sc_rescue",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&tra, &s_rescue_timer));
+
     wifi_config_t saved = {
         .sta = {
             .scan_method = WIFI_FAST_SCAN,
@@ -481,6 +558,7 @@ void wifi_reconnect(void) {
     creds_clear();
     s_state = CSTATE_SC_LISTEN;
     s_retry = 0;
+    esp_timer_stop(s_rescue_timer);   /* creds just wiped — nothing to rescue */
     esp_wifi_disconnect();
     sc_start();
 }
