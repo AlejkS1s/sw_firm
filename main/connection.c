@@ -23,6 +23,7 @@
  */
 
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
@@ -41,6 +42,7 @@
 #include "connection.h"
 #include "board.h"
 #include "timing.h"
+#include "device_id.h"
 
 #define TAG "wifi"
 
@@ -67,7 +69,6 @@
 #define BACKOFF_BASE_MS 1000
 #define WIFI_WARMUP_ATTEMPTS 3
 
-#define MDNS_HOSTNAME      "switchiot"
 #define MDNS_INSTANCE_NAME "ESP8266 Relay"
 #define MDNS_SERVICE_TYPE  "_http"
 #define MDNS_SERVICE_PROTO "_tcp"
@@ -413,11 +414,15 @@ static void on_got_ip(void *data) {
         ESP_LOGI(TAG, "NTP started");
     }
     if (!s_mdns_done) {
+        char dev_id[DEVICE_ID_MIN_LEN];
+        device_id(dev_id, sizeof(dev_id));
+        char mdns_host[DEVICE_ID_MIN_LEN + 8];   /* "switch" + id + NUL */
+        snprintf(mdns_host, sizeof(mdns_host), "switch%s", dev_id);
         if (mdns_init() == ESP_OK) {
-            mdns_hostname_set(MDNS_HOSTNAME);
+            mdns_hostname_set(mdns_host);
             mdns_txt_item_t txt[] = {
-                {"device", MDNS_HOSTNAME},
-                {"type",   MDNS_HOSTNAME},
+                {"device", dev_id},
+                {"type",   "esp8266-relay"},
                 {"path",   "/"}
             };
             mdns_service_add(MDNS_INSTANCE_NAME,
@@ -425,7 +430,7 @@ static void on_got_ip(void *data) {
                              MDNS_SERVICE_PORT,
                              txt, sizeof(txt)/sizeof(txt[0]));
             s_mdns_done = true;
-            ESP_LOGI(TAG, "mDNS started");
+            ESP_LOGI(TAG, "mDNS started as %s.local", mdns_host);
         }
     }
 }

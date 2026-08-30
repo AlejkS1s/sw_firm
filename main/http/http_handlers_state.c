@@ -14,13 +14,12 @@
 #include "state.h"
 #include "nvs_store.h"
 #include "timing.h"
+#include "device_id.h"
 
 #include "http_handlers.h"
 #include "http_util.h"
 
 #define TAG "http_state"
-
-#define DEVICE_ID_MIN_LEN 7   /* 6 hex chars + NUL */
 
 
 /* ── Device ID ─────────────────────────────────────────────────────────────
@@ -29,7 +28,7 @@
  * last 3 bytes of MAC as uppercase hex, e.g. "A1B2C3".
  * The buffer must be at least DEVICE_ID_MIN_LEN (7) bytes.
  * ──────────────────────────────────────────────────────────────────────── */
-static void device_id(char *buf, size_t buflen) {
+void device_id(char *buf, size_t buflen) {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(buf, buflen, "%02X%02X%02X",
@@ -238,4 +237,20 @@ esp_err_t post_system_factory_reset(httpd_req_t *req) {
 
 esp_err_t get_ping(httpd_req_t *req) {
     return send_ok(req);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * GET /api/v1/id — lightweight device identifier only.
+ * Returns {"id":"A1B2C3"} where the ID is the last 3 bytes of the STA MAC.
+ * This is the stable device identifier that survives IP/DNS changes.
+ * ══════════════════════════════════════════════════════════════════════════ */
+esp_err_t get_id(httpd_req_t *req) {
+    char dev_id[DEVICE_ID_MIN_LEN];
+    device_id(dev_id, sizeof(dev_id));
+
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "{\"id\":\"%s\"}", dev_id);
+    if (n < 0 || n >= (int)sizeof(buf))
+        return send_error(req, E_INTERNAL, "id serialization failed");
+    return send_json(req, buf);
 }

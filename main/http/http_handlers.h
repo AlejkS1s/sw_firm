@@ -12,6 +12,7 @@ esp_err_t get_system(httpd_req_t *req);         /* GET  /api/v1/system          
 esp_err_t post_system_reset(httpd_req_t *req);         /* POST /api/v1/system/reset        */
 esp_err_t post_system_factory_reset(httpd_req_t *req); /* POST /api/v1/system/factory-reset */
 esp_err_t get_ping(httpd_req_t *req);                  /* GET  /api/v1/ping                */
+esp_err_t get_id(httpd_req_t *req);                    /* GET  /api/v1/id                  */
 
 /* ── http_handlers_control.c ─────────────────────────────────────────────
  * Actuation and device configuration.

@@ -36,6 +36,7 @@ static const route_t s_routes[] = {
     {"/api/v1/system/reset",      HTTP_POST,   post_system_reset},
     {"/api/v1/system/factory-reset", HTTP_POST, post_system_factory_reset},
     {"/api/v1/ping",              HTTP_GET,    get_ping},
+    {"/api/v1/id",                HTTP_GET,    get_id},
     {"/api/v1/relay",             HTTP_POST,   post_relay},
     {"/api/v1/config/boot",       HTTP_PUT,    put_boot},
     {"/api/v1/config/led",        HTTP_PUT,    put_led},
@@ -157,11 +158,15 @@ esp_err_t http_server_start(void) {
         }
     }
 
-    /* CORS preflight for mutation endpoints (non-GET). Deduplication relies
-     * on same-URI routes being adjacent in s_routes[] — keep them grouped. */
+    /* CORS preflight (OPTIONS) for EVERY route, including GET-only endpoints.
+     * Chrome's Private Network Access requires a successful preflight before a
+     * file:// (or other cross-origin) page may talk to a private IP such as
+     * 192.168.x.x; without an OPTIONS handler on GET routes the device answers
+     * 405 and the browser blocks every request. dispatch() already returns the
+     * correct CORS + Access-Control-Allow-Private-Network headers. Deduplication
+     * relies on same-URI routes being adjacent in s_routes[] — keep them grouped. */
     const char *last = NULL;
     for (int i = 0; i < (int)ARRAY_LEN(s_routes); i++) {
-        if (s_routes[i].method == HTTP_GET) continue;
         if (last && strcmp(s_routes[i].uri, last) == 0) continue;
         httpd_uri_t u = { .uri = s_routes[i].uri, .method = HTTP_OPTIONS, .handler = dispatch };
         esp_err_t e = httpd_register_uri_handler(server, &u);
