@@ -10,14 +10,23 @@
 #include "nvs_store.h"
 
 #include "board.h"     /* relay_set_async, RELAY_STR, LOCK_GUARD */
+#include "countdown.h" /* countdown_is_active — runtime priority arbitration */
+#include "power.h"
 #include "routines.h"
+#include "sse.h"
 #include "timing.h"
 #include "state.h"
 
 #define TAG "rt"
 
 #define ROUTINES_STACK  2560
-#define ROUTINES_PRIO   4
+/* Control task: highest user priority — GPIO/scheduling outrank HTTP (3).
+ * Owns ALL periodic work (routines, countdown, auto-off, relay persist flush,
+ * LED eval, power management, SSE heartbeat). Max sleep bounds worst-case
+ * lateness of every tick-driven action. */
+#define ROUTINES_PRIO   5
+#define CTRL_TICK_US    500000
+#define CTRL_TICK_MS    (CTRL_TICK_US / USEC_PER_MSEC)
 
 /* ── Static state ───────────────────────────────────────────────────────── */
 static routine_entry_t s_slots[ROUTINES_MAX];
@@ -44,7 +53,7 @@ static void refresh_active_mask(void) {
     bool time_ok = timing_is_time_valid();
     LOCK_GUARD(g_routines_mutex) {
         for (int i = 0; i < ROUTINES_MAX; i++) {
-            if (!s_slots[i].in_use) continue;
+            if (!s_slots[i].in_use || !s_slots[i].enabled) continue;
             if (s_slots[i].type == RT_SCHEDULE)
                 mask |= RT_SCHEDULE;
             else if (time_ok && circulate_in_window_for_entry(&s_slots[i], now, NULL))
@@ -70,13 +79,36 @@ static void routines_nvs_load(void) {
         memset(s_slots, 0, sizeof(s_slots));
         return;
     }
-    /* If blob size doesn't match current struct layout (e.g. after upgrading
-     * from older firmware), invalidate all slots to avoid misinterpreting
-     * old bytes as the new date_start/date_end fields. */
+    /* v1 blob (pre-`enabled`/`magic`, 36 B/slot): all fields up to relay_on
+     * are valid, but `enabled`/`magic` read padding garbage. Migrate instead
+     * of clearing so upgrading firmware keeps the user's routines. */
+    if (sz == ROUTINE_LEGACY_BLOB_SIZE) {
+        int n = 0;
+        for (int i = 0; i < ROUTINES_MAX; i++) {
+            if (!s_slots[i].in_use) continue;
+            s_slots[i].enabled = true;
+            s_slots[i].magic   = ROUTINE_BLOB_MAGIC;
+            n++;
+        }
+        ESP_LOGW(TAG, "migrated %d routine slot(s) from v1 blob layout", n);
+        routines_nvs_save();
+        return;
+    }
+    /* If blob size doesn't match current struct layout, invalidate all slots
+     * to avoid misinterpreting bytes from an unknown layout. */
     if (sz != sizeof(s_slots)) {
         ESP_LOGW(TAG, "slot blob size mismatch (%u vs %u), clearing",
                  (unsigned)sz, (unsigned)sizeof(s_slots));
         memset(s_slots, 0, sizeof(s_slots));
+        return;
+    }
+    /* v2 blob — sanity-check the magic of every used slot. */
+    for (int i = 0; i < ROUTINES_MAX; i++) {
+        if (s_slots[i].in_use && s_slots[i].magic != ROUTINE_BLOB_MAGIC) {
+            ESP_LOGW(TAG, "slot %d magic mismatch, clearing all", i);
+            memset(s_slots, 0, sizeof(s_slots));
+            break;
+        }
     }
 }
 
@@ -184,12 +216,19 @@ bool circulate_in_window_for_entry(const routine_entry_t *e, time_t now, time_t 
  * ══════════════════════════════════════════════════════════════════════════ */
 
 bool circulate_overlaps(const routine_entry_t *entry, int exclude_idx) {
+    /* A disabled routine is inert: it cannot conflict with anything, and the
+     * scheduler never fires it. This is what makes disable-then-rearrange
+     * workflows work — disabling frees the time window (see PUT handler). */
+    if (!entry->enabled) return false;
+
     int new_start = entry->hour * MIN_PER_HOUR + entry->minute;
     int new_end   = entry->end_hour * MIN_PER_HOUR + entry->end_minute;
 
     for (int i = 0; i < ROUTINES_MAX; i++) {
         if (i == exclude_idx) continue;
-        if (!s_slots[i].in_use || s_slots[i].type != RT_CIRCULATE) continue;
+        if (!s_slots[i].in_use || !s_slots[i].enabled ||
+            s_slots[i].type != RT_CIRCULATE)
+            continue;
 
         const routine_entry_t *exist = &s_slots[i];
 
@@ -209,6 +248,61 @@ bool circulate_overlaps(const routine_entry_t *entry, int exclude_idx) {
         int exist_end   = exist->end_hour * MIN_PER_HOUR + exist->end_minute;
         if (new_start < exist_end && exist_start < new_end)
             return true;
+    }
+    return false;
+}
+
+/* A schedule fires at a fixed h:m on matching days. It conflicts with:
+ *  - another schedule firing at the same h:m (same date range + overlapping days)
+ *  - a circulate whose window contains that h:m (same date range + overlapping days)
+ * Disabled entries are inert and never conflict. */
+static bool schedule_conflicts(const routine_entry_t *entry, int exclude_idx) {
+    if (!entry->enabled) return false;
+    int fire_min = entry->hour * MIN_PER_HOUR + entry->minute;
+    for (int i = 0; i < ROUTINES_MAX; i++) {
+        if (i == exclude_idx) continue;
+        const routine_entry_t *o = &s_slots[i];
+        if (!o->in_use || !o->enabled) continue;
+        /* Different date ranges cannot overlap */
+        if (entry->date_start != o->date_start ||
+            entry->date_end   != o->date_end)
+            continue;
+        /* days=0 means "any weekday" — skip the weekday intersection check
+         * for either side being 0 (they overlap on every matching day) */
+        if (entry->days != 0 && o->days != 0 &&
+            !(entry->days & o->days))
+            continue;
+        if (o->type == RT_CIRCULATE) {
+            int ws = o->hour * MIN_PER_HOUR + o->minute;
+            int we = o->end_hour * MIN_PER_HOUR + o->end_minute;
+            if (fire_min >= ws && fire_min < we) return true;
+        } else { /* RT_SCHEDULE */
+            int of = o->hour * MIN_PER_HOUR + o->minute;
+            if (fire_min == of) return true;
+        }
+    }
+    return false;
+}
+
+/* Symmetric guard for the circulate path: reject a circulate whose window
+ * contains any enabled schedule's fire time (same date range + overlapping
+ * days). Keeps schedule-vs-circulate conflicts out in both directions. */
+static bool circulate_schedule_conflict(const routine_entry_t *entry, int exclude_idx) {
+    if (!entry->enabled) return false;
+    int ws = entry->hour * MIN_PER_HOUR + entry->minute;
+    int we = entry->end_hour * MIN_PER_HOUR + entry->end_minute;
+    for (int i = 0; i < ROUTINES_MAX; i++) {
+        if (i == exclude_idx) continue;
+        const routine_entry_t *o = &s_slots[i];
+        if (!o->in_use || !o->enabled || o->type != RT_SCHEDULE) continue;
+        if (entry->date_start != o->date_start ||
+            entry->date_end   != o->date_end)
+            continue;
+        if (entry->days != 0 && o->days != 0 &&
+            !(entry->days & o->days))
+            continue;
+        int of = o->hour * MIN_PER_HOUR + o->minute;
+        if (of >= ws && of < we) return true;
     }
     return false;
 }
@@ -238,6 +332,7 @@ static void circulate_cleanup_expired(void) {
 static time_t slot_next_fire(int i, time_t now) {
     const routine_entry_t *e = &s_slots[i];
     if (!e->in_use) return -1;
+    if (!e->enabled) return -1;   /* disabled routines never fire */
 
     if (e->type == RT_SCHEDULE)
         return next_weekday_time(e->hour, e->minute, e->days, now);
@@ -326,8 +421,24 @@ static time_t slot_next_fire(int i, time_t now) {
  * Firing
  * ══════════════════════════════════════════════════════════════════════════ */
 
+typedef struct { uint8_t idx; bool on; } due_action_t;
+
 static void fire_due(time_t now) {
+    /* Runtime priority arbitration: a countdown owns the relay while it is
+     * active, so routines pause (do not fire) until it completes or is
+     * cancelled — the two never fight over the output. Manual toggles still
+     * win (relay_set is always applied); auto-off is already mutually
+     * exclusive with countdown/routines at creation time. */
+    if (countdown_is_active()) return;
+
+    due_action_t actions[ROUTINES_MAX];
+    int n_actions = 0;
     bool dirty;
+
+    /* Phase 1 — under lock: compute due slots and update phase bookkeeping
+     * ONLY (cheap, pure memory). Never call relay_set/NVS while holding the
+     * mutex: state_snapshot_build() needs this lock on every /state request,
+     * and holding it across flash writes stalled the whole device under load. */
     LOCK_GUARD(g_routines_mutex) {
         circulate_cleanup_expired();
 
@@ -335,6 +446,13 @@ static void fire_due(time_t now) {
             if (!s_slots[i].in_use) continue;
             time_t t = slot_next_fire(i, now);
             if (t < 0 || t > now) continue;
+            /* Schedule fired while we were offline/timeless? Fire it only
+             * within the grace window; older ones are skipped (the next
+             * occurrence is recomputed fresh on every tick). Circulate is
+             * exempt: skipping would stall its phase bookkeeping — instead
+             * it fires once and re-anchors s_last_toggle_epoch to now. */
+            if (s_slots[i].type == RT_SCHEDULE &&
+                (now - t) > ROUTINE_FIRE_MAX_LATE_S) continue;
 
             bool on;
             if (s_slots[i].type == RT_SCHEDULE) {
@@ -356,12 +474,23 @@ static void fire_due(time_t now) {
                     on = s_circ_phase[i];
                 }
             }
-            relay_set(on);
-            ESP_LOGI(TAG, "fired slot %d type=%d -> %s",
-                     i, s_slots[i].type, RELAY_STR(on));
+            actions[n_actions].idx = (uint8_t)i;
+            actions[n_actions].on  = on;
+            n_actions++;
         }
         dirty = s_dirty;
         s_dirty = false;
+    }
+
+    /* Phase 2 — outside lock: apply relay actions and persist slot mutations.
+     * Reading e->type for logging is benign: type is immutable per slot and
+     * slots only shrink under the same mutex we no longer hold (worst case a
+     * concurrently removed slot logs a stale type — harmless). */
+    for (int k = 0; k < n_actions; k++) {
+        const routine_entry_t *e = &s_slots[actions[k].idx];
+        relay_set(actions[k].on);
+        ESP_LOGI(TAG, "fired slot %d type=%d -> %s",
+                 actions[k].idx, e->type, RELAY_STR(actions[k].on));
     }
     if (dirty) routines_nvs_save();
 }
@@ -407,16 +536,22 @@ void routines_task(void *arg) {
     (void)arg;
     for (;;) {
         esp_task_wdt_reset();
-        time_t next = arm_next();
 
+        /* Sleep until the next routine fire, capped at CTRL_TICK_MS so the
+         * consolidated housekeeping ticks never lag beyond one interval. */
+        time_t next = arm_next();
         TickType_t wait;
         if (next > 0) {
             time_t delta = next - time(NULL);
             if (delta < 0) delta = 0;
-            wait = (TickType_t)delta * (MSEC_PER_SEC / portTICK_PERIOD_MS);
+            TickType_t fire_ticks =
+                (TickType_t)delta * (MSEC_PER_SEC / portTICK_PERIOD_MS);
+            TickType_t cap = CTRL_TICK_MS / portTICK_PERIOD_MS;
+            wait = (fire_ticks < cap) ? fire_ticks : cap;
         } else {
-            wait = portMAX_DELAY;
+            wait = CTRL_TICK_MS / portTICK_PERIOD_MS;
         }
+        if (wait == 0) wait = 1;
         ulTaskNotifyTake(pdTRUE, wait);
 
         if (timing_time_ok() && !s_time_ok)
@@ -426,6 +561,13 @@ void routines_task(void *arg) {
             fire_due(time(NULL));
 
         refresh_active_mask();
+
+        /* Consolidated housekeeping — each is bounded and non-blocking. */
+        countdown_tick();
+        relay_persist_tick();
+        led_update();
+        power_process();
+        sse_heartbeat_tick();
     }
 }
 
@@ -471,7 +613,13 @@ routine_handle_t routine_create(uint8_t type, const routine_entry_t *params) {
         }
 
         /* Overlap check (pre-lock read is safe — slots only grow monotonically) */
-        if (circulate_overlaps(params, -1)) return NULL;
+        if (circulate_overlaps(params, -1) ||
+            circulate_schedule_conflict(params, -1))
+            return NULL;
+    } else {
+        /* Schedule validations (pre-lock) — same fire time as another schedule
+         * or inside a circulate window is rejected. */
+        if (schedule_conflicts(params, -1)) return NULL;
     }
 
     routine_handle_t h = NULL;
@@ -481,6 +629,8 @@ routine_handle_t routine_create(uint8_t type, const routine_entry_t *params) {
             s_slots[i] = *params;
             s_slots[i].type = type;
             s_slots[i].in_use = true;
+            s_slots[i].enabled = true;   /* new routines start enabled */
+            s_slots[i].magic   = ROUTINE_BLOB_MAGIC;
             h = &s_slots[i];
             break;
         }
@@ -491,6 +641,47 @@ routine_handle_t routine_create(uint8_t type, const routine_entry_t *params) {
         routines_wake();
     }
     return h;
+}
+
+esp_err_t routine_update(routine_handle_t h, const routine_entry_t *params) {
+    if (!h || !h->in_use) return ESP_ERR_INVALID_ARG;
+    int i = (int)(h - s_slots);
+    if (i < 0 || i >= ROUTINES_MAX) return ESP_ERR_INVALID_ARG;
+    if (!params || params->type != h->type) return ESP_ERR_INVALID_ARG;
+
+    /* Same validations as create (auto-off conflict is handled by the HTTP
+     * layer, since disabling is always allowed while auto-off is armed). */
+    if (params->type == RT_CIRCULATE) {
+        if (params->interval_on == 0 || params->interval_off == 0)
+            return ESP_ERR_INVALID_ARG;
+        int smin = params->hour * MIN_PER_HOUR + params->minute;
+        int emin = params->end_hour * MIN_PER_HOUR + params->end_minute;
+        if (smin >= emin) return ESP_ERR_INVALID_ARG;
+        if (params->date_start != CIRC_DATE_NONE &&
+            params->date_start > params->date_end)
+            return ESP_ERR_INVALID_ARG;
+        if (circulate_overlaps(params, i) ||
+            circulate_schedule_conflict(params, i))
+            return ESP_ERR_INVALID_ARG;
+    } else {
+        if (schedule_conflicts(params, i)) return ESP_ERR_INVALID_ARG;
+    }
+
+    LOCK_GUARD(g_routines_mutex) {
+        s_slots[i] = *params;
+        s_slots[i].type   = h->type;    /* type immutable on edit */
+        s_slots[i].in_use = true;
+        s_slots[i].magic  = ROUTINE_BLOB_MAGIC;
+        /* Restart cycle bookkeeping so a changed window/duty takes effect
+         * cleanly instead of firing on a stale phase/interval. */
+        s_circ_phase[i]       = false;
+        s_last_toggle_epoch[i] = 0;
+    }
+    routines_nvs_save();
+    notify_bump_state();
+    refresh_active_mask();
+    routines_wake();
+    return ESP_OK;
 }
 
 esp_err_t routine_remove(routine_handle_t h) {
@@ -517,6 +708,19 @@ routine_handle_t routine_at(int idx) {
         if (s_slots[idx].in_use) h = &s_slots[idx];
     }
     return h;
+}
+
+/* Snapshot used routine indices under ONE mutex acquisition — replaces
+ * N× routine_at() lock round-trips in hot read paths (state snapshot,
+ * which previously contended with fire_due() on every /state request). */
+int routine_snapshot_ids(uint8_t *ids, int max) {
+    int n = 0;
+    LOCK_GUARD(g_routines_mutex) {
+        for (int i = 0; i < ROUTINES_MAX && n < max; i++) {
+            if (s_slots[i].in_use) ids[n++] = (uint8_t)i;
+        }
+    }
+    return n;
 }
 
 int routine_count(void) {

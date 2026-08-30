@@ -47,6 +47,7 @@ static const route_t s_routes[] = {
     {"/api/v1/timer",             HTTP_DELETE, delete_timer},
     {"/api/v1/routines",          HTTP_GET,    get_routines},
     {"/api/v1/routines",          HTTP_POST,   post_routines},
+    {"/api/v1/routines",          HTTP_PUT,    put_routine},
     {"/api/v1/routines",          HTTP_DELETE, delete_routine},
 };
 

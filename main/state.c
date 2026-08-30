@@ -79,13 +79,7 @@ void state_snapshot_build(state_snapshot_t *s) {
     s->auto_off_m            = ao.minute;
     s->auto_off_s            = ao.second;
 
-    s->routine_count = 0;
-    for (int i = 0; i < ROUTINES_MAX; i++) {
-        if (routine_at(i)) {
-            s->routine_ids[s->routine_count] = (uint8_t)i;
-            s->routine_count++;
-        }
-    }
+    s->routine_count = routine_snapshot_ids(s->routine_ids, ROUTINES_MAX);
 
     strncpy(s->tz, timing_get_timezone(), TZ_MAX_LEN - 1);
 

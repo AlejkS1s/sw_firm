@@ -25,7 +25,7 @@ static size_t routine_to_json(const routine_entry_t *e, int idx, char *buf, size
         e->interval_on, e->interval_off,
         (unsigned long)e->duration_s, e->days,
         (unsigned long)e->date_start, (unsigned long)e->date_end,
-        BOOL_STR(e->relay_on), BOOL_STR(e->in_use));
+        BOOL_STR(e->relay_on), BOOL_STR(e->enabled));
     return snprintf_guard(n, buflen);
 }
 
@@ -76,10 +76,12 @@ esp_err_t post_routines(httpd_req_t *req) {
     cJSON *root = parse_json_body(req);
     if (!root) return send_error(req, E_BAD_JSON, ERR_BAD_JSON);
 
-    routine_entry_t entry = { .in_use = true };
+    routine_entry_t entry = { .in_use = true, .enabled = true, .magic = ROUTINE_BLOB_MAGIC };
     uint8_t type = (uint8_t)json_get_int(root, "t", 0);
-    entry.hour       = (uint8_t)json_get_int(root, "sh", 0);
-    entry.minute     = (uint8_t)json_get_int(root, "sm", 0);
+    /* Start hour/minute. `h`/`m` are the documented + frontend keys; `sh`/`sm`
+     * are accepted as a legacy fallback. */
+    entry.hour       = (uint8_t)json_get_int(root, "h", json_get_int(root, "sh", 0));
+    entry.minute     = (uint8_t)json_get_int(root, "m", json_get_int(root, "sm", 0));
     entry.end_hour   = (uint8_t)json_get_int(root, "eh", 0);
     entry.end_minute = (uint8_t)json_get_int(root, "em", 0);
     entry.interval_on  = (uint16_t)json_get_int(root, "ion", 0);
@@ -108,6 +110,65 @@ esp_err_t post_routines(httpd_req_t *req) {
     char buf[RESP_BUF_SIZE];
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"i\":%d}", idx);
     return send_json(req, buf);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * PUT /api/v1/routines?id=N
+ * Edit a routine and/or toggle its enabled state. Body fields are overlaid
+ * on the routine's current values (all optional), so this single endpoint
+ * covers both full edits (send the whole config) and enable/disable-only
+ * toggles (send just {"en":bool}).
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+esp_err_t put_routine(httpd_req_t *req) {
+    const char *q = uri_query_start(req);
+    char idv[8];
+    if (!q || httpd_query_key_value(q + 1, "id", idv, sizeof(idv)) != ESP_OK)
+        return send_error(req, E_INVALID_ARG, "id query parameter required");
+    int idx = (int)strtol(idv, NULL, 10);
+
+    cJSON *root = parse_json_body(req);
+    if (!root) return send_error(req, E_BAD_JSON, ERR_BAD_JSON);
+
+    routine_handle_t h = routine_at(idx);
+    if (!h) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "PUT routine id=%d not found", idx);
+        return send_error(req, E_NOT_FOUND, ERR_ROUTINE_NOT_FOUND);
+    }
+
+    /* Candidate = current entry overlaid with provided fields. */
+    routine_entry_t entry = *h;
+    entry.hour       = (uint8_t)json_get_int(root, "h",  entry.hour);
+    entry.minute     = (uint8_t)json_get_int(root, "m",  entry.minute);
+    entry.end_hour   = (uint8_t)json_get_int(root, "eh", entry.end_hour);
+    entry.end_minute = (uint8_t)json_get_int(root, "em", entry.end_minute);
+    entry.interval_on  = (uint16_t)json_get_int(root, "ion", entry.interval_on);
+    entry.interval_off = (uint16_t)json_get_int(root, "ioff", entry.interval_off);
+    entry.duration_s   = (uint32_t)json_get_int(root, "dur", entry.duration_s);
+    entry.days         = (uint8_t)(json_get_int(root, "d", entry.days) & DAYS_MASK);
+    entry.date_start   = (uint32_t)json_get_int(root, "ds", entry.date_start);
+    entry.date_end     = (uint32_t)json_get_int(root, "de", entry.date_end);
+    entry.relay_on     = json_get_bool(root, "on", entry.relay_on);
+    entry.enabled      = json_get_bool(root, "en", entry.enabled);
+    entry.type         = (uint8_t)json_get_int(root, "t", entry.type);
+    cJSON_Delete(root);
+
+    /* Enabling/keeping a routine enabled while auto-off is armed would fight
+     * the safety auto-off — reject like POST does. Disabling is always
+     * allowed (it frees the conflict). */
+    if (entry.enabled) {
+        esp_err_t conflict = check_auto_off_conflict(req);
+        if (conflict != ESP_OK) return conflict;
+    }
+
+    if (routine_update(h, &entry) != ESP_OK) {
+        ESP_LOGW(TAG, "PUT routine id=%d type=%d FAILED", idx, entry.type);
+        return send_error(req, E_CONFLICT, "invalid config, type change, or overlap");
+    }
+
+    ESP_LOGI(TAG, "PUT routine id=%d enabled=%d", idx, entry.enabled);
+    return send_ok(req);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

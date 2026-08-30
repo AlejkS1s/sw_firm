@@ -31,6 +31,7 @@ esp_err_t delete_timer(httpd_req_t *req);       /* DELETE /api/v1/timer         
  */
 esp_err_t get_routines(httpd_req_t *req);       /* GET    /api/v1/routines[?id=] */
 esp_err_t post_routines(httpd_req_t *req);      /* POST   /api/v1/routines       */
+esp_err_t put_routine(httpd_req_t *req);        /* PUT    /api/v1/routines?id=   */
 esp_err_t delete_routine(httpd_req_t *req);     /* DELETE /api/v1/routines?id=   */
 
 #endif /* HTTP_HANDLERS_H */

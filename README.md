@@ -64,9 +64,12 @@ All endpoints live under `/api/v1/`. CORS is enabled (`Access-Control-Allow-Orig
 | DELETE | `/api/v1/timer`       | —                             | `{"ok":true}` |
 | GET    | `/api/v1/routines`    | —                             | `[{...}]` (full array) or `?id=N` for one entry |
 | POST   | `/api/v1/routines`    | `{"t":int,"h":int,"m":int,"eh":int,"em":int,"ion":int,"ioff":int,"dur":int,"d":int,"on":bool}` | `{"ok":true,"i":int}` |
+| PUT    | `/api/v1/routines?id=N` | any subset (all fields optional), e.g. `{"en":false}` | `{"ok":true}` |
 | DELETE | `/api/v1/routines?id=N`| —                            | `{"ok":true}` |
 
 CORS enabled (`Access-Control-Allow-Origin: *`). `d` (days) is a bitmask: bit0=Sun … bit6=Sat. Routine type `t`: 1=schedule, 2=circulate.
+
+Routines carry an **enabled** flag (`en` in PUT bodies, `e` in GET responses). Disabled routines are skipped by the scheduler. `PUT /api/v1/routines?id=N` with `{"en":false}` disables, `{"en":true}` re-enables; it also serves as the edit endpoint (any subset of fields, type `t` immutable).
 
 **Boot modes:** 0=OFF, 1=ON, 2=AUTO (restore last saved state)
 
