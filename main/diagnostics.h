@@ -5,7 +5,7 @@
 
 /* Firmware version — single source of truth for the whole firmware.
  * FW_BUILD is set at compile time from __DATE__ and __TIME__. */
-#define FW_VER    "2.3.0"
+#define FW_VER    "2.3.1"
 #define FW_BUILD  __DATE__ " " __TIME__
 
 /* Increments and persists the boot counter. Call once at startup, after
