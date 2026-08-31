@@ -450,7 +450,12 @@ static void fire_due(time_t now) {
     /* Phase 1 — under lock: compute due slots and update phase bookkeeping
      * ONLY (cheap, pure memory). Never call relay_set/NVS while holding the
      * mutex: state_snapshot_build() needs this lock on every /state request,
-     * and holding it across flash writes stalled the whole device under load. */
+     * and holding it across flash writes stalled the whole device under load.
+     *
+     * NOTE: we deliberately do NOT clear s_dirty here. routines_persist_tick()
+     * runs in the control task context (same task as fire_due), but the actual
+     * NVS write is deferred to its next tick. This keeps the flash-cache stall
+     * (which blocks lwIP) off the httpd task's send() path. */
     LOCK_GUARD(g_routines_mutex) {
         circulate_cleanup_expired();
 
@@ -485,26 +490,26 @@ static void fire_due(time_t now) {
                     s_last_toggle_epoch[i] = (uint32_t)now;
                     on = s_circ_phase[i];
                 }
+                s_dirty = true;  /* circulate phase/epoch changed — persist on next tick */
             }
             actions[n_actions].idx = (uint8_t)i;
             actions[n_actions].on  = on;
             n_actions++;
         }
-        dirty = s_dirty;
-        s_dirty = false;
     }
 
-    /* Phase 2 — outside lock: apply relay actions and persist slot mutations.
-     * Reading e->type for logging is benign: type is immutable per slot and
-     * slots only shrink under the same mutex we no longer hold (worst case a
-     * concurrently removed slot logs a stale type — harmless). */
+    /* Phase 2 — outside lock: apply relay actions. The relay_set() calls
+     * notify_bump_state() which queues SSE pushes to the httpd task via
+     * httpd_queue_work() (non-blocking). NVS persistence is handled by
+     * routines_persist_tick() on the next control-task tick — NEVER inline
+     * here, because the flash-cache stall from nvs_commit() blocks lwIP and
+     * would stall the httpd task's send() for up to SO_SNDTIMEO. */
     for (int k = 0; k < n_actions; k++) {
         const routine_entry_t *e = &s_slots[actions[k].idx];
         relay_set(actions[k].on);
         ESP_LOGI(TAG, "fired slot %d type=%d -> %s",
                  actions[k].idx, e->type, RELAY_STR(actions[k].on));
     }
-    if (dirty) routines_nvs_save();
 }
 
 static void routines_sync(void) {
