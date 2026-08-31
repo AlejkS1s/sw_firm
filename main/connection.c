@@ -71,8 +71,13 @@
 
 /* Radio stabilization delay before the first connect after esp_wifi_start().
  * The PHY needs a brief settle after the driver comes up; connecting
- * immediately can fail on marginal hardware. */
-#define WIFI_WARMUP_US 150000ULL
+ * immediately can fail on marginal hardware. On a cold boot with a cheap
+ * AC-DC supply (HLK-PM01 + LDO), the rail is still sagging from TX bursts
+ * even after the 500 ms power-stabilize delay in main.c — 300 ms gives the
+ * PA's internal LDO a clean window to lock before the first association
+ * attempt. ESPHome's wifi_component.cpp uses similar timing (300-500 ms)
+ * for the same reason. */
+#define WIFI_WARMUP_US 300000ULL
 
 /* Stuck-WiFi watchdog: if we've been trying to associate (SAVED/SC_VERIFY)
  * with NO progress (no STA_CONNECTED / GOT_IP) for this long, the radio or
@@ -329,6 +334,16 @@ static void on_sta_start(void) {
     if (s_state == CSTATE_SAVED) {
         led_set_pattern(LED_BLINK_SLOW);
         esp_wifi_set_ps(WIFI_PS_NONE);
+        /* Lower initial TX power for the first association on a marginal
+         * supply. Full-power TX (80 / +20 dBm) draws ~250 mA in bursts; on
+         * a sagging AC-DC rail the PA's PLL unlocks mid-packet, the ACK
+         * is lost, and the retry compounds the problem. +12.5 dBm (50)
+         * is enough for typical home APs at <10 m and keeps the rail clean.
+         * ESP-01S's PCB antenna is the bottleneck anyway — going below
+         * +10 dBm gains nothing. SmartConfig keeps full power in
+         * on_sc_got_ssid_pwd() because the phone may be across the room
+         * during initial provisioning. */
+        esp_wifi_set_max_tx_power(50);
         {   wifi_config_t c;
             if (esp_wifi_get_config(ESP_IF_WIFI_STA, &c) == ESP_OK) {
                 c.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;

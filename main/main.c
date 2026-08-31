@@ -53,6 +53,19 @@ void app_main(void) {
         }
     }
 
+    /* Power-stabilization delay. Cheap AC-DC supplies (HLK-PM01 and similar
+     * 5V/700mA Aliexpress modules) take 200 ms – 1.5 s for the output rail
+     * to settle on cold start. The 3.3V LDO feeding the ESP-01S needs time
+     * for its input cap to charge before the radio's TX bursts (~250 mA)
+     * can be supplied cleanly. 500 ms is a safe middle value — long enough
+     * for the rail to stabilize, short enough that the user doesn't notice.
+     * Without this, the first WiFi association attempt on a fresh supply
+     * sees a sagging rail, the PA's PLL unlocks mid-packet, and association
+     * loops before the watchdog gives up. */
+#define POWER_STABILIZE_MS 500
+    vTaskDelay(pdMS_TO_TICKS(POWER_STABILIZE_MS));
+#undef POWER_STABILIZE_MS
+
     tcpip_adapter_init();
     tcpip_adapter_set_default_wifi_handlers();
 
