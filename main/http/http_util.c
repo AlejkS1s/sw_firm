@@ -27,7 +27,10 @@ esp_err_t send_error(httpd_req_t *req, api_err_t code, const char *msg) {
     char buf[192];
     int n = snprintf(buf, sizeof(buf), "{\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}",
                       ERR_TABLE[code].name, msg);
-    return httpd_resp_send(req, buf, n);
+    esp_err_t e = httpd_resp_send(req, buf, n);
+    /* The response (headers + body) is sent. Return ESP_OK so the httpd does not
+     * treat this as a handler failure and log a spurious warning. */
+    return (e == ESP_OK) ? ESP_OK : e;
 }
 
 esp_err_t send_json(httpd_req_t *req, const char *json) {

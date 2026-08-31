@@ -65,16 +65,23 @@ esp_err_t send_json(httpd_req_t *req, const char *json);
 
 /* Conflict guard for operations that must not run while auto-off is armed.
  * Used by timer-post and routines-post in http_handlers_control.c and
- * http_handlers_routines.c.  Sends the error response if armed, always
- * returns ESP_FAIL on conflict so the caller's `if (conflict != ESP_OK)`
- * catches it regardless of what send_error returns. */
+ * http_handlers_routines.c. Sends the 409 response if armed, then returns
+ * ESP_FAIL so the handler's `if (conflict != ESP_OK) return conflict` fires
+ * and skips the operation. send_error() returns ESP_OK on success, so the
+ * handler ends up returning ESP_OK to the httpd — no spurious ESP_FAIL warning. */
 static inline esp_err_t check_auto_off_conflict(httpd_req_t *req) {
     if (relay_auto_off_is_armed()) {
         send_error(req, E_CONFLICT, "auto-off is armed; clear it before this operation");
-        return ESP_FAIL;
+        return ESP_FAIL;   /* triggers handler's `if (x != ESP_OK) return x` guard */
     }
     return ESP_OK;
 }
+
+/* Symmetric guard: reject arming auto-off if any routine is enabled.
+ * The safety auto-off must not fight an active schedule/circulate.
+ * Used only by the auto-off arm path in http_handlers_control.c.
+ * Returns ESP_FAIL so the handler can `if (x != ESP_OK) return ESP_OK`. */
+esp_err_t check_routine_conflict(httpd_req_t *req);
 
 /* Convenience: sends {"ok":true}. Replaces the ad-hoc send_json call that
  * appears in 10+ handlers. */

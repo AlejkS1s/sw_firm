@@ -97,7 +97,7 @@ esp_err_t post_routines(httpd_req_t *req) {
         return send_error(req, E_INVALID_ARG, "unknown routine type");
 
     esp_err_t conflict = check_auto_off_conflict(req);
-    if (conflict != ESP_OK) return conflict;
+    if (conflict != ESP_OK) return ESP_OK;   /* response already sent by send_error() */
 
     routine_handle_t h = routine_create(type, &entry);
     if (!h) {
@@ -157,9 +157,14 @@ esp_err_t put_routine(httpd_req_t *req) {
     /* Enabling/keeping a routine enabled while auto-off is armed would fight
      * the safety auto-off — reject like POST does. Disabling is always
      * allowed (it frees the conflict). */
+    ESP_LOGI(TAG, "PUT routine id=%d candidate.enabled=%d, auto_off_armed=%d",
+             idx, entry.enabled, relay_auto_off_is_armed() ? 1 : 0);
     if (entry.enabled) {
         esp_err_t conflict = check_auto_off_conflict(req);
-        if (conflict != ESP_OK) return conflict;
+        if (conflict != ESP_OK) {
+            ESP_LOGW(TAG, "PUT routine id=%d blocked by auto-off", idx);
+            return ESP_OK;   /* response already sent by send_error() */
+        }
     }
 
     if (routine_update(h, &entry) != ESP_OK) {

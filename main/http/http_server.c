@@ -2,9 +2,12 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 
 #include "power.h"
+#include "sse.h"
 #include "http_handlers.h"
 #include "http_util.h"
 #include "clients.h"
@@ -16,6 +19,22 @@
  * HTTP under load. esp_timer daemon sits at 2. */
 #define HTTPD_TASK_PRIO 3
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+/* Diagnostic heartbeat — fires every 30s on the httpd task to surface
+ * silent hangs (where the device stops responding but no error is logged).
+ * Logs a simple mark so serial gaps >30s between "dispatch" lines = hang.
+ * Also logs WiFi RSSI so correlation between weak signal and hangs is visible. */
+static void heartbeat_cb(void *arg) {
+    (void)arg;
+    int8_t rssi = 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+        rssi = ap.rssi;
+    ESP_LOGW(TAG, "HB: alive rssi=%ddb sse=%d heap=%lu/%lu",
+             (int)rssi, sse_client_count(),
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size());
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Route table — the entire URI surface in one place. This is the single
@@ -94,6 +113,10 @@ static esp_err_t dispatch(httpd_req_t *req) {
     esp_err_t ret = ESP_ERR_NOT_FOUND;
     const char *matched = NULL;
 
+    ESP_LOGI(TAG, "[DBG] dispatch IN: %s %s heap=%lu",
+             method_name(req->method), req->uri,
+             (unsigned long)esp_get_free_heap_size());
+
     for (int i = 0; i < (int)ARRAY_LEN(s_routes); i++) {
         if (req->method == s_routes[i].method &&
             plen == strlen(s_routes[i].uri) &&
@@ -106,15 +129,18 @@ static esp_err_t dispatch(httpd_req_t *req) {
 
     int64_t dt_us = esp_timer_get_time() - t0;
     if (matched) {
-        ESP_LOGI(TAG, "%s %s -> %s (%lu us)",
+        ESP_LOGI(TAG, "%s %s -> %s (%lu us) [heap=%lu]",
                  method_name(req->method), matched,
-                 esp_err_to_name(ret), (unsigned long)dt_us);
+                 esp_err_to_name(ret), (unsigned long)dt_us,
+                 (unsigned long)esp_get_free_heap_size());
     } else {
         ESP_LOGW(TAG, "%s %s -> 404 (%lu us)",
                  method_name(req->method), req->uri, (unsigned long)dt_us);
         ret = send_error(req, E_NOT_FOUND, "no such endpoint");
     }
-
+    ESP_LOGI(TAG, "[DBG] dispatch OUT: %s %s heap=%lu",
+             method_name(req->method), matched ? matched : req->uri,
+             (unsigned long)esp_get_free_heap_size());
     return ret;
 }
 
@@ -131,8 +157,16 @@ esp_err_t http_server_start(void) {
      * and SNTP also draw from the same socket pool on ESP8266. Lower this
      * if httpd_start() logs socket-allocation failures. */
     cfg.max_open_sockets = 7;
-    cfg.recv_wait_timeout = 10;
-    cfg.send_wait_timeout = 10;
+    /* Single-core ESP8266: the httpd task shares one core with lwIP/WiFi.
+     * A 10s send/recv timeout means a slow `send()` blocks the httpd task
+     * for up to 10s while lwIP cannot push ANY other socket's data to the
+     * radio. On a weak WiFi link this manifests as: dispatch logs the
+     * request + response, the handler returns, but the response bytes
+     * never reach the client (browser times out). 2s is plenty for a
+     * <1KB JSON response on a healthy link; if a send blocks for 2s the
+     * link is broken and the client should retry on a fresh socket. */
+    cfg.recv_wait_timeout = 2;
+    cfg.send_wait_timeout = 2;
     cfg.task_priority     = HTTPD_TASK_PRIO;
     /* If every socket is a held-open SSE stream, an incoming REST command
      * must still be able to get through — reclaim the oldest connection
@@ -145,6 +179,16 @@ esp_err_t http_server_start(void) {
         ESP_LOGE(TAG, "Failed: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    /* Diagnostic heartbeat — 30s periodic log so silent httpd hangs are
+     * visible. ESP_LOGW to land in any default-level boot log. */
+    esp_timer_handle_t hb_timer;
+    esp_timer_create_args_t hb_args = {
+        .callback = &heartbeat_cb,
+        .name     = "http_hb",
+    };
+    if (esp_timer_create(&hb_args, &hb_timer) == ESP_OK)
+        esp_timer_start_periodic(hb_timer, 30000000ULL);   /* 30 s */
 
     esp_err_t result = ESP_OK;
     for (int i = 0; i < (int)ARRAY_LEN(s_routes); i++) {

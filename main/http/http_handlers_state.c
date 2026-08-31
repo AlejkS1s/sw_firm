@@ -80,8 +80,16 @@ esp_err_t get_state(httpd_req_t *req) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 esp_err_t get_state_stream(httpd_req_t *req) {
+    /* Get the fd BEFORE any other processing so we can pre-mark it. This
+     * guards against the ESP-IDF httpd bug where sess_iterate() returns
+     * the same fd twice in one loop iteration — the second visit would
+     * process the fd (and block on recv) before sse_register() has run. */
+    int sse_fd = httpd_req_to_sockfd(req);
+    sse_mark_seen(sse_fd);
+
     if (!sse_register(req)) {
         ESP_LOGW(TAG, "SSE registration rejected (all slots full)");
+        sse_clear_seen(sse_fd);
         httpd_resp_set_status(req, "503 Service Unavailable");
         set_cors(req);
         return httpd_resp_send(req, NULL, 0);
@@ -107,6 +115,10 @@ esp_err_t get_state_stream(httpd_req_t *req) {
             httpd_resp_send_chunk(req, buf, off);
         }
     }
+
+    /* sse_register already called sse_mark_fd(sse_fd, true). Clear the
+     * "seen" guard so the fd is only tracked via sse_fds[]. */
+    sse_clear_seen(sse_fd);
 
     return ESP_OK;
 }

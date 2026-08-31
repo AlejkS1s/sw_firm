@@ -7,6 +7,7 @@
 #include "board.h"
 #include "countdown.h"
 #include "power.h"
+#include "routines.h"
 #include "sse.h"
 #include "timing.h"
 
@@ -127,6 +128,13 @@ esp_err_t put_auto_off(httpd_req_t *req) {
     uint32_t total_s = HMS_TO_SEC(h, m, s);
     if (total_s == 0 || total_s > MAX_DURATION_S)
         return send_error(req, E_INVALID_ARG, "duration must be between 1 second and 24 hours");
+    /* Symmetric to check_auto_off_conflict(): reject arming auto-off while
+     * any routine is enabled. The safety auto-off must never fight an
+     * active schedule/circulate. */
+    if (routine_any_enabled()) {
+        ESP_LOGW(TAG, "auto-off arm rejected: routine enabled");
+        return send_error(req, E_CONFLICT, "a routine is currently active; disable it before arming auto-off");
+    }
     if (!relay_set_auto_off(h, m, s))
         return send_error(req, E_CONFLICT, "a timer or routine is currently active");
     ESP_LOGI(TAG, "auto-off set %02d:%02d:%02d", h, m, s);
@@ -148,7 +156,7 @@ esp_err_t post_timer(httpd_req_t *req) {
     if (dur == 0 || dur > MAX_DURATION_S)
         return send_error(req, E_INVALID_ARG, "dur must be between 1 and 86400 seconds");
     esp_err_t conflict = check_auto_off_conflict(req);
-    if (conflict != ESP_OK) return conflict;
+    if (conflict != ESP_OK) return ESP_OK;   /* response already sent by send_error() */
 
     countdown_set(dur, relay_on);
     ESP_LOGI(TAG, "timer set %lus -> %s", (unsigned long)dur, RELAY_STR(relay_on));
