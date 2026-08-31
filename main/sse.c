@@ -31,6 +31,7 @@ typedef struct {
 
 static sse_client_t s_clients[SSE_MAX_CLIENTS];
 static volatile bool s_push_pending = false;
+static volatile bool s_hb_pending   = false;
 static state_snapshot_t s_last_snapshot;
 static bool s_has_snapshot = false;
 
@@ -48,6 +49,7 @@ static void sse_deactivate_slot(int i) {
     if (!s_clients[i].active) return;
     ESP_LOGI(TAG, "deactivate slot=%d fd=%d id=%s", i, s_clients[i].fd, s_clients[i].client_id);
     bool last = sse_is_last_ref(i);
+    sse_mark_fd(s_clients[i].fd, false);
     s_clients[i].active = false;
     s_clients[i].client_id[0] = '\0';
     if (last) {
@@ -84,16 +86,91 @@ void sse_close_all(void) {
         sse_deactivate_slot(i);
 }
 
+int sse_client_count(void) {
+    int n = 0;
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++)
+        if (s_clients[i].active) n++;
+    return n;
+}
+
+/* ── SSE fd registry ─────────────────────────────────────────────────────
+ * The ESP-IDF httpd is single-threaded: its main loop calls select() and
+ * then httpd_sess_process() for every fd that select() reports as
+ * readable. For a long-lived SSE stream where the browser only reads
+ * (never writes), lwIP can still mark the socket readable (e.g. for
+ * disconnect detection), which would make the httpd call
+ * httpd_sess_process -> httpd_parse_req -> read_block -> recv() with the
+ * SO_RCVTIMEO timeout. On the single-core ESP8266, that recv() blocks
+ * the httpd task for 2s while lwIP cannot push any other socket's data
+ * to the radio — no other client can connect and no heartbeat is sent.
+ *
+ * The SSE module marks its fds here when the SSE handler is registered.
+ * The httpd loop calls sse_fd_is_active(fd) before processing a session
+ * and skips fds that are SSE streams. The entry is cleared when the
+ * SSE slot is deactivated. The lookup is O(N) where N=SSE_MAX_CLIENTS=2,
+ * which is trivial. */
+static int sse_fds[SSE_MAX_CLIENTS] = { -1, -1 };
+/* Guard against re-entrancy: if s_seen_fds[] contains fd X, skip X even if
+ * not yet in sse_fds[]. The ESP-IDF httpd sometimes iterates the session
+ * table and returns the same fd twice in one loop (a bug in sess_iterate
+ * when a new session is added mid-iteration). Without this guard, the
+ * second visit processes the same fd before sse_register() has run. */
+static int s_seen_fds[SSE_MAX_CLIENTS] = { -1, -1 };
+static int s_seen_count = 0;
+
+void sse_mark_fd(int fd, bool active) {
+    if (active) {
+        for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+            if (sse_fds[i] == fd) return;
+        }
+        for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+            if (sse_fds[i] < 0) { sse_fds[i] = fd; return; }
+        }
+    } else {
+        for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+            if (sse_fds[i] == fd) { sse_fds[i] = -1; return; }
+        }
+    }
+}
+
+bool sse_fd_is_active(int fd) {
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++)
+        if (sse_fds[i] == fd) return true;
+    return false;
+}
+
+/* Called from the SSE handler BEFORE sse_register() to pre-mark the fd so
+ * that a re-entrant visit to the same fd (from the ESP-IDF httpd bug where
+ * sess_iterate returns the same fd twice in one loop) is also skipped. */
+void sse_mark_seen(int fd) {
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+        if (s_seen_fds[i] == fd) return;
+    }
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+        if (s_seen_fds[i] < 0) { s_seen_fds[i] = fd; return; }
+    }
+}
+
+void sse_clear_seen(int fd) {
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+        if (s_seen_fds[i] == fd) { s_seen_fds[i] = -1; return; }
+    }
+}
+
+bool sse_fd_is_seen(int fd) {
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++)
+        if (s_seen_fds[i] == fd) return true;
+    return false;
+}
+
 /* ── Heartbeat ────────────────────────────────────────────────────────── */
 
-/* Control-task tick (500 ms cadence): every SSE_HEARTBEAT_DIVIDER ticks,
- * evict stale clients and push a heartbeat frame to live connections. */
-void sse_heartbeat_tick(void) {
-    static int divider = 0;
-    if (++divider < SSE_HEARTBEAT_DIVIDER) return;
-    divider = 0;
-
-    if (s_unique_fds == 0 || !s_sse_enabled) return;
+/* Runs on the httpd task (via httpd_queue_work) — NOT the control task.
+ * Evicts stale clients and pushes a heartbeat frame to live connections.
+ * All socket I/O (send/recv) happens here so a slow/dead client can never
+ * stall the control task. Mirrors sse_push_work(). */
+static void sse_heartbeat_work(void *arg) {
+    (void)arg;
 
     uint32_t now = now_ms();
     time_t t = time(NULL);
@@ -103,9 +180,9 @@ void sse_heartbeat_tick(void) {
     int datalen = snprintf(buf + 12, sizeof(buf) - 12,
         "id: %lu\nevent: heartbeat\ndata: %ld\n\n",
         (unsigned long)g_state_version, (long)t);
-    if (datalen < 0 || (size_t)(datalen + 12 + 2) > sizeof(buf)) return;
+    if (datalen < 0 || (size_t)(datalen + 12 + 2) > sizeof(buf)) { s_hb_pending = false; return; }
     int hdrlen = snprintf(buf, 12, "%x\r\n", datalen);
-    if (hdrlen < 0 || hdrlen >= 12) return;
+    if (hdrlen < 0 || hdrlen >= 12) { s_hb_pending = false; return; }
     int gap = 12 - hdrlen;
     if (gap > 0)
         memmove(buf + hdrlen, buf + 12, (size_t)datalen);
@@ -134,6 +211,30 @@ void sse_heartbeat_tick(void) {
             sse_deactivate_slot(i);
         }
     }
+
+    s_hb_pending = false;
+}
+
+/* Control-task tick (500 ms cadence): every SSE_HEARTBEAT_DIVIDER ticks,
+ * queue the heartbeat to the httpd task. Returns immediately — no socket
+ * I/O on the control task. */
+void sse_heartbeat_tick(void) {
+    static int divider = 0;
+    if (++divider < SSE_HEARTBEAT_DIVIDER) return;
+    divider = 0;
+
+    if (s_unique_fds == 0 || !s_sse_enabled) return;
+    if (s_hb_pending) return;
+    s_hb_pending = true;
+
+    httpd_handle_t handle = NULL;
+    for (int i = 0; i < SSE_MAX_CLIENTS; i++) {
+        if (s_clients[i].active) { handle = s_clients[i].handle; break; }
+    }
+    if (!handle) { s_hb_pending = false; return; }
+
+    if (httpd_queue_work(handle, sse_heartbeat_work, NULL) != ESP_OK)
+        s_hb_pending = false;
 }
 
 /* ── Registration ─────────────────────────────────────────────────────── */
@@ -200,6 +301,18 @@ bool sse_register(httpd_req_t *req) {
     httpd_handle_t handle = req->handle;
     char client_id[SSE_CLIENT_ID_MAX_LEN] = "";
     get_query_param(req->uri, "client_id", client_id, sizeof(client_id));
+
+    /* Mark this fd as an SSE stream so the httpd loop knows to skip it on
+     * future select() wakeups. Without this, every time select() reports
+     * the fd as readable (e.g. lwIP marks idle sockets readable for
+     * disconnect detection), httpd_sess_process is called, which calls
+     * httpd_parse_req -> read_block -> httpd_recv_with_opt, which BLOCKS
+     * for SO_RCVTIMEO (2s) waiting for the next HTTP request. On a
+     * single-core ESP8266 that 2s blocks the httpd task completely and
+     * no other client can connect, no SSE heartbeat is sent, and the
+     * control task is starved. sse_fd_is_sse() tells the httpd loop to
+     * ignore this fd in the read_set processing. */
+    sse_mark_fd(fd, true);
 
     /* Single scan: find replace slot, free slot, or candidate for eviction. */
     int replace_idx = -1, free_idx = -1;
