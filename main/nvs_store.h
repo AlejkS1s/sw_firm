@@ -48,6 +48,7 @@
 
 /* ── Keys — diag namespace ────────────────────────────────────────────── */
 #define NVS_KEY_DIAG_BOOTS     "boots"
+#define NVS_KEY_DIAG_BROWNOUTS "brownouts"
 
 /* ── Keys — power namespace ───────────────────────────────────────────── */
 #define NVS_KEY_POWER_SAVE     "ps_off"

@@ -14,6 +14,7 @@
 #include "timing.h"
 
 static uint32_t s_boot_count = 0;
+static uint32_t s_brownout_count = 0;
 
 const char *diagnostics_reset_reason_str(esp_reset_reason_t r) {
     switch (r) {
@@ -36,6 +37,15 @@ void diagnostics_init(void) {
     nvs_store_get_u32(NVS_NS_DIAG, NVS_KEY_DIAG_BOOTS, &s_boot_count);
     s_boot_count++;
     nvs_store_set_u32(NVS_NS_DIAG, NVS_KEY_DIAG_BOOTS, s_boot_count);
+
+    /* Track brownout resets so the user can see how often the PSU is
+     * dipping below the ESP8266's brownout threshold. The detector itself
+     * is hardware; this counter makes the failure mode visible. */
+    nvs_store_get_u32(NVS_NS_DIAG, NVS_KEY_DIAG_BROWNOUTS, &s_brownout_count);
+    if (esp_reset_reason() == ESP_RST_BROWNOUT) {
+        s_brownout_count++;
+        nvs_store_set_u32(NVS_NS_DIAG, NVS_KEY_DIAG_BROWNOUTS, s_brownout_count);
+    }
 }
 
 unsigned long diagnostics_boot_count(void) {
@@ -51,6 +61,7 @@ size_t diagnostics_build_json(char *buf, size_t buflen) {
         "{"
         "\"rreason\":\"%s\","
         "\"boots\":%lu,"
+        "\"brownouts\":%lu,"
         "\"uptm\":%lu,"
         "\"free\":%lu,"
         "\"minfree\":%lu,"
@@ -62,6 +73,7 @@ size_t diagnostics_build_json(char *buf, size_t buflen) {
         "}",
         diagnostics_reset_reason_str(esp_reset_reason()),
         (unsigned long)s_boot_count,
+        (unsigned long)s_brownout_count,
         uptime,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),

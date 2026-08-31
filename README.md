@@ -49,7 +49,7 @@ All endpoints live under `/api/v1/`. CORS is enabled (`Access-Control-Allow-Orig
 | Method | Endpoint              | Body                          | Response                    |
 |--------|-----------------------|-------------------------------|-----------------------------|
 | GET    | `/api/v1/state`       | —                             | control + countdown + auto-off snapshot (ETag-cached) |
-| GET    | `/api/v1/state/stream`| —                             | SSE stream (full state push on change, 25s heartbeat) |
+| GET    | `/api/v1/state/stream`| —                             | SSE stream (full state push on change, 15s heartbeat) |
 | GET    | `/api/v1/system`      | —                             | device identity + diagnostics + WiFi info |
 | POST   | `/api/v1/system/reset`| —                             | `{"ok":true,"message":"rebooting"}` |
 | POST   | `/api/v1/system/factory-reset`| —                       | `{"ok":true,"message":"factory reset, rebooting"}` |

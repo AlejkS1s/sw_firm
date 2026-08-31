@@ -58,6 +58,12 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    /* Arm the hardware task watchdog as early as possible so a hang during
+     * Phase 2-3 boot (board/timing/countdown/routines init) is caught, not
+     * just a hang in the running control task. The control task feeds it via
+     * esp_task_wdt_reset() once it starts. */
+    ESP_ERROR_CHECK(esp_task_wdt_init());
+
     connection_init();  /* g_net_evt */
     state_init();       /* g_state_evt */
     diagnostics_init(); /* boot counter */
@@ -76,7 +82,6 @@ void app_main(void) {
 
     /* ── Phase 3: System services ──────────────────────────────────── */
     int64_t t3 = esp_timer_get_time();
-    ESP_ERROR_CHECK(esp_task_wdt_init());
 
     http_server_start();
     ESP_LOGI(TAG, "phase3 services: %lu us", (unsigned long)(esp_timer_get_time() - t3));

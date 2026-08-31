@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include "esp_log.h"
 #include "esp_timer.h"
 
 #include "board.h"
@@ -108,6 +109,7 @@ void notify_bump_state(void) {
  * subsequent ask before the next change is free. */
 static void ensure_fresh(void) {
     if (s_hash_dirty) {
+        ESP_LOGI("state", "ensure_fresh: rebuilding snapshot");
         state_snapshot_build(&s_cached_snap);
         s_cached_hash = fnv1a_hash(&s_cached_snap, STATE_HASH_LEN);
         s_hash_dirty  = false;
