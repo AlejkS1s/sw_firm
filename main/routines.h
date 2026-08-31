@@ -73,6 +73,11 @@ typedef routine_entry_t *routine_handle_t;
 void routines_init(void);
 void routines_wake(void);
 
+/* Flush a pending routine-slot NVS write. Called from the control task tick;
+ * routine_create/update/remove only mark the dirty flag so HTTP handlers
+ * never block on flash (mirrors relay_persist_tick()/countdown_tick()). */
+void routines_persist_tick(void);
+
 /* Shared active mask — bit0=schedule, bit1=circulate. */
 extern volatile uint8_t g_routine_active_mask;
 
@@ -88,6 +93,9 @@ routine_handle_t routine_at(int idx);
 int             routine_snapshot_ids(uint8_t *ids, int max);
 int             routine_count(void);
 int             routine_index(routine_handle_t h);
+/* True if any slot is in_use AND enabled. Used to reject arming auto-off
+ * while a routine exists (the safety auto-off would fight it). */
+bool            routine_any_enabled(void);
 bool circulate_in_window_for_entry(const routine_entry_t *e, time_t now, time_t *out_end);
 bool circulate_overlaps(const routine_entry_t *entry, int exclude_idx);
 uint32_t date_today_ymd(void);

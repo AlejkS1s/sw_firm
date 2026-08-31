@@ -46,7 +46,8 @@ static char s_tz[TZ_MAX_LEN];
 /* ── ntp_health_cb ────────────────────── */
 /* Periodic health check for NTP sync. Called by the health esp_timer.
  * Monitors sntp_get_sync_status() and restarts NTP if no sync after 60s.
- * On success, saves epoch and notifies via timing_on_ntp_synced(). */
+ * On success, sets the synced flag and wakes the routines task to handle
+ * all side effects from the routines task context. */
 static void ntp_health_cb(void *arg) {
     if (s_ntp_synced) return;
 
@@ -54,8 +55,7 @@ static void ntp_health_cb(void *arg) {
     if (st == SNTP_SYNC_STATUS_COMPLETED) {
         s_ntp_synced = true;
         ESP_LOGI(TAG, "NTP sync completed");
-        timing_save();
-        timing_on_ntp_synced();
+        routines_wake();
         return;
     }
 
@@ -116,18 +116,6 @@ void timing_save(void) {
     ESP_LOGI(TAG, "Saved epoch=%ld", (long)now);
 }
 
-/* ── timing_on_ntp_synced ─────────────── */
-/* Called when NTP sync completes (directly or via health check).
- * Notifies the routines task to re-arm its event-scheduled timers. */
-void timing_on_ntp_synced(void) {
-    ESP_LOGI(TAG, "Time synced");
-    routines_wake();
-    /* time_ok flips false -> true here and feeds the state hash; without
-     * this, SSE subscribers and /state's ETag wouldn't reflect the sync
-     * until some unrelated event bumped state. */
-    notify_bump_state();
-}
-
 /* ── timing_ntp_start ─────────────────── */
 /* Initialises lwIP SNTP with hardcoded time.google.com IP (bypasses
  * DNS which fails with IP strings). Registers timing_ntp_sync_cb()
@@ -165,18 +153,14 @@ void timing_ntp_health_start(void) {
 /* ── timing_ntp_sync_cb ───────────────── */
 /* SNTP notification callback, registered via
  * sntp_set_time_sync_notification_cb(). Called by lwIP SNTP when
- * an NTP response is received and the clock is updated. Persists
- * the synced epoch and notifies via timing_on_ntp_synced(). */
+ * an NTP response is received and the clock is updated. Sets the
+ * synced flag and wakes the routines task to handle all side effects
+ * (NVS persistence, state bump, SSE push) from the routines task context,
+ * not the tcpip thread. */
 void timing_ntp_sync_cb(struct timeval *tv) {
     ESP_LOGI(TAG, "NTP sync callback: time=%ld", (long)tv->tv_sec);
     s_ntp_synced = true;
-    /* Do NOT call timing_save() here — this callback runs in the lwIP
-     * SNTP task (tcpip thread).  nvs_commit() does a flash erase+write
-     * that disables the SPI cache and blocks ALL TCP/IP processing
-     * (ARP, TCP, UDP) for tens of ms, making the device unreachable.
-     * Instead, the routines task (woken by routines_wake() below) will
-     * call timing_save() from its own safe context. */
-    timing_on_ntp_synced();
+    routines_wake();
 }
 
 /* ── timing_time_ok ───────────────────── */

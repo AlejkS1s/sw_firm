@@ -39,7 +39,6 @@ static inline bool timing_is_time_valid(void) {
 
 void timing_init(void);
 void timing_save(void);
-void timing_on_ntp_synced(void);
 void timing_ntp_start(void);
 void timing_ntp_health_start(void);
 void timing_ntp_sync_cb(struct timeval *tv);

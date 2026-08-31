@@ -72,6 +72,18 @@ static esp_err_t routines_nvs_save(void) {
                               s_slots, sizeof(s_slots));
 }
 
+/* Control-task tick: flush a pending routine-slot NVS write. Keeps the
+ * flash write (10-50 ms SPI-cache stall) off the HTTP handler path —
+ * routine_create/update/remove only set s_dirty. */
+void routines_persist_tick(void) {
+    bool dirty;
+    LOCK_GUARD(g_routines_mutex) {
+        dirty = s_dirty;
+        s_dirty = false;
+    }
+    if (dirty) routines_nvs_save();
+}
+
 static void routines_nvs_load(void) {
     size_t sz = sizeof(s_slots);
     if (nvs_store_get_blob(NVS_NS_ROUTINES, NVS_KEY_ROUTINE_SLOTS,
@@ -504,6 +516,7 @@ static void routines_sync(void) {
     }
     if (dirty) routines_nvs_save();
     timing_save();
+    notify_bump_state();
     refresh_active_mask();
     ESP_LOGI(TAG, "Time synced, routines active");
 }
@@ -565,6 +578,7 @@ void routines_task(void *arg) {
         /* Consolidated housekeeping — each is bounded and non-blocking. */
         countdown_tick();
         relay_persist_tick();
+        routines_persist_tick();
         led_update();
         power_process();
         sse_heartbeat_tick();
@@ -635,7 +649,7 @@ routine_handle_t routine_create(uint8_t type, const routine_entry_t *params) {
             break;
         }
     }
-    if (h) { routines_nvs_save();
+    if (h) { s_dirty = true;
         notify_bump_state();
         refresh_active_mask();
         routines_wake();
@@ -677,7 +691,7 @@ esp_err_t routine_update(routine_handle_t h, const routine_entry_t *params) {
         s_circ_phase[i]       = false;
         s_last_toggle_epoch[i] = 0;
     }
-    routines_nvs_save();
+    s_dirty = true;
     notify_bump_state();
     refresh_active_mask();
     routines_wake();
@@ -694,7 +708,7 @@ esp_err_t routine_remove(routine_handle_t h) {
         s_last_toggle_epoch[i] = 0;
         s_circ_phase[i] = false;
     }
-    routines_nvs_save();
+    s_dirty = true;
     notify_bump_state();
     refresh_active_mask();
     routines_wake();
@@ -730,6 +744,16 @@ int routine_count(void) {
             if (s_slots[i].in_use) n++;
     }
     return n;
+}
+
+bool routine_any_enabled(void) {
+    bool any = false;
+    LOCK_GUARD(g_routines_mutex) {
+        for (int i = 0; i < ROUTINES_MAX; i++) {
+            if (s_slots[i].in_use && s_slots[i].enabled) { any = true; break; }
+        }
+    }
+    return any;
 }
 
 int routine_index(routine_handle_t h) {
